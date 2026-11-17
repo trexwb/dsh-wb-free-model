@@ -13,7 +13,7 @@
   "license": "MIT",
   "source": {
     "repository": "https://github.com/trexwb/dsh-wb-free-model",
-    "revision": "b07fd5f"
+    "revision": "064d07c"
   },
   "x-ecosystem-packaging": {
     "adapterIsolation": "src/adapter.js is the only module that talks to the DSH llm service; it imports nothing from @deepseek-ai/*.",
