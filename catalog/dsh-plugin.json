@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Yan-Zero/dsh-std/3df054302468d2091859db4b3bd079042d33f100/packages/manifest/schema/dsh-plugin-0.15.schema.json",
+  "manifestVersion": "0.15",
+  "id": "dev.trexwb.dsh-wb-free-model",
+  "name": "dsh-wb-free-model",
+  "version": "0.1.0",
+  "facets": {
+    "host": {
+      "entry": "index.js",
+      "apiVersion": "v1alpha1"
+    }
+  },
+  "license": "MIT",
+  "source": {
+    "repository": "https://github.com/trexwb/dsh-wb-free-model",
+    "revision": "b07fd5f"
+  },
+  "x-ecosystem-packaging": {
+    "adapterIsolation": "src/adapter.js is the only module that talks to the DSH llm service; it imports nothing from @deepseek-ai/*.",
+    "runtime": "An isolated, loopback-only OpenCode server is downloaded from npm (sha512 verified), restricted to a child-env allowlist, and terminated with the plugin fiber.",
+    "provenance": "业务逻辑移植自 https://github.com/trexwb/wbBridge"
+  }
+}
