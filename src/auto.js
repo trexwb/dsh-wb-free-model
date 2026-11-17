@@ -37,19 +37,30 @@ function chatOnly(model, result) {
 }
 
 function fits(model, result, { images, tools }) {
-  if (chatOnly(model, result)) return !tools
+  // A chat-only model may still serve the request, but only when it actually
+  // covers the requested modalities: image requests must not land on a
+  // chat-only model that lacks image input, or complete() will reject it.
+  if (chatOnly(model, result)) return !tools && (!images || model.images === true)
   if (images && tools) return model.images === true && model.toolcall === true
   if (images) return model.images === true
   if (tools) return model.toolcall === true
   return true
 }
 
-/** Candidates by capability/effort; an empty match falls back to the whole pool. */
+/**
+ * Candidates by capability/effort. Two tiers: when no model matches the
+ * capability filters, the pool still comes back as a last resort (complete()
+ * then rejects a tools/images mismatch with 400 — pre-existing fallback
+ * semantics), but the requested effort is never dropped: a pool that cannot
+ * serve the effort yields no candidate at all, and the request fails with
+ * MODEL_UNAVAILABLE instead of a misleading per-model 400.
+ */
 export function candidates(models, results, request) {
   const pool = models.filter(model => model.paid !== true)
   const matching = pool.filter(model => fits(model, results[model.id], request))
     .filter(model => request.effort === undefined || acceptsEffort(model, request.effort))
-  return matching.length === 0 ? pool : matching
+  if (matching.length > 0) return matching
+  return request.effort === undefined ? pool : pool.filter(model => acceptsEffort(model, request.effort))
 }
 
 /**

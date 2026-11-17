@@ -55,13 +55,47 @@ function inlineImage(block, resolveImage) {
     try {
       const stat = fs.statSync(ref.path)
       if (stat.size > 8 * 1024 * 1024) return undefined
-      const extension = path.extname(ref.path).slice(1).toLowerCase() || 'png'
-      const mime = extension === 'jpg' ? 'image/jpeg' : `image/${extension}`
-      const data = fs.readFileSync(ref.path).toString('base64')
-      return dataUrlOf(`data:${mime};base64,${data}`)
+      const extension = path.extname(ref.path).slice(1).toLowerCase()
+      // Only real image bytes may be inlined: the extension must be one of the
+      // whitelisted types AND the file header must match it. Without the magic
+      // check, any file renamed to .png would be sent to the gateway as an image.
+      const mime = IMAGE_MIME_BY_EXTENSION.get(extension)
+      if (mime === undefined) return undefined
+      const data = fs.readFileSync(ref.path)
+      if (sniffImageType(data) !== mime) return undefined
+      return dataUrlOf(`data:${mime};base64,${data.toString('base64')}`)
     } catch {
       return undefined
     }
+  }
+  return undefined
+}
+
+const IMAGE_MIME_BY_EXTENSION = new Map([
+  ['png', 'image/png'],
+  ['jpg', 'image/jpeg'],
+  ['jpeg', 'image/jpeg'],
+  ['webp', 'image/webp'],
+  ['gif', 'image/gif'],
+])
+
+function sniffImageType(buffer) {
+  if (buffer.length >= 8
+    && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47
+    && buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a) {
+    return 'image/png'
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return 'image/jpeg'
+  }
+  if (buffer.length >= 6) {
+    const head = buffer.subarray(0, 6).toString('latin1')
+    if (head === 'GIF87a' || head === 'GIF89a') return 'image/gif'
+  }
+  if (buffer.length >= 12
+    && buffer.subarray(0, 4).toString('latin1') === 'RIFF'
+    && buffer.subarray(8, 12).toString('latin1') === 'WEBP') {
+    return 'image/webp'
   }
   return undefined
 }
