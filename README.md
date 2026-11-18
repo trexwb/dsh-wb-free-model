@@ -9,7 +9,7 @@
 
 并额外提供 `WB · auto`：按实测耗时加权自动挑选当前可用的免费模型。业务逻辑移植自 [wbBridge](https://github.com/trexwb/wbBridge)：免费模型发现与探测、加权自动选择、会话与权限边界。
 
-因为整条车道都是插件进程内的出站 HTTPS，**iOS 等无法派生子进程的宿主同样可用**——这是本插件相对早期版本（本机拉起 OpenCode 运行时）的根本变化。
+因为整条车道都是插件进程内的出站 HTTPS，**iOS 等无法派生子进程的宿主同样可用**——这是本插件相对早期版本（本机拉起 OpenCode 运行时）的根本变化。在手机侧，这具体指 **Fish Pocket（DSH Agent 的 TestFlight App）**：它把 DSH 引擎连同 Node 24 一起打包进 App，插件 Host 半身就在其中运行。iPhone 上的可用面与限制见 [在 iPhone 上用](#在-iphone-上用)。
 
 ## 它做什么
 
@@ -34,7 +34,22 @@ npx @deepseek-ai/dsh web
 
 桌面端也可以在「设置 → 插件」里从仓库地址安装，然后在「设置 → WB Free Model」查看模型列表。
 
+iPhone 上没有命令行：在 Fish Pocket 的「设置 → 插件」里新增 bundle，规格填 `github:trexwb/dsh-wb-free-model`，由 App 内的包管理器拉取并启用。
+
 启动后模型会出现在 DSH 的模型选择器里，供应商名为 **WB Free Model**，第一项是 **WB · auto**。没有首次下载：所有上游流量都是插件进程内的普通 HTTPS 请求。
+
+## 在 iPhone 上用
+
+Fish Pocket 运行插件的 Host 半身，**不运行浏览器半身**：`client.js` 与它的 React 面板、以及注入设置页的扩展槽，在原生界面里根本不渲染。因此本插件把手机上需要的东西全部放在 Host 侧：
+
+- **模型可用**：模型经 `adapter.listModels()` 发布，原生选择器读 `session/modelCatalog`，`WB · auto` 与 `OC · *` / `KL · *` 一样出现在列表里，直接对话与工具调用都走同一条车道。
+- **开关可改**：`enabled`（车道总开关）与 `probeOnBoot`（启动时自动检测）注册成设置 namespace `dsh-wb-free-model`，原生设置页按 schema 自动渲染成真实表单（开关于是 App 里的开关，不是网页）。开关翻转的后效（撤回模型 / 重新拉起车道）与网页端完全一致，走同一套代码。
+- **动作可做**：五个工具让对话里就能管理车道——`wb_free_model_status`（状态，`detail="models"` 列逐个模型）、`wb_free_model_refresh`（刷新清单，可带 `probe`）、`wb_free_model_probe`（检测全部或单个）、`wb_free_model_retry`（清失败记录并解禁）、`wb_free_model_settings`（改两个开关）。它们是异步动作的启动器，进度用 `wb_free_model_status` 追。
+- **完整管理页**：逐模型重试按钮、权重表、配额窗口提示在 React 面板里；手机上看它要走「探索 → 网页版」（面板调用的 `/api/wb-free-model/*` 只接受本机回环，App 内网页正是从回环访问的）。
+
+工具与设置两条路都通过 `src/actions.js` 这一份动作实现，网页 API 只是同一份实现的第三个入口，所以三处规则不会各自漂移。
+
+尚未在真机上验证的一项：图像附件在 App 的文件视图里能否被 `attachments.imageHostPath` 正确解析（插件只把它读成 data URL，路径解析由 DSH 负责）。
 
 ## 模型标识
 
@@ -56,6 +71,8 @@ npx @deepseek-ai/dsh web
 
 **启用车道开关是完整的启停开关**：关闭后，全部模型（含 `WB · auto`）立即从 DSH 模型选择器移除，进行中的探测安静退出，状态接口如实显示停用；状态持久化，重启 DSH 不会自动拉起，直到重新开启。开启后走既有启动路径：清单刷新 → 按需探测 → 模型重新发布。
 
+这两个开关同时注册为设置 namespace `dsh-wb-free-model`，因此在没有浏览器半身的宿主（iPhone）上仍然是原生表单里的两个开关；两边写的是同一份值，`state.json` 里保存的是它的镜像。
+
 同一份数据也通过 `GET /api/wb-free-model/status` 暴露，POST 路由为 `/refresh`、`/probe`、`/retry`、`/settings`。这些路由只接受本机回环地址、只接受 `application/json`。`/refresh`、`/probe` 是异步的：立即返回 `202`，进度与结果通过状态轮询获取。车道关闭时它们返回 `409`。
 
 ## 数据与日志
@@ -63,9 +80,11 @@ npx @deepseek-ai/dsh web
 默认数据目录：`~/.dsh/dsh-wb-free-model`（`DSH_HOME` 可覆盖）。
 
 ```
-state.json                 目录快照与探测结果（0600）
+state.json                 目录快照、探测结果与开关镜像（0600）
 session-map.json           对话 → 上游会话映射（免费车道配额按会话计）
 ```
+
+开关（`enabled` / `probeOnBoot`）的权威位置取决于宿主：有设置服务时是设置文档的 `dsh-wb-free-model` 分节（原生表单与工具都写这里），`state.json` 只保存镜像；没有设置服务时 `state.json` 本身就是权威。组合配置（`cordis.patch.yml` 的 `config`）是二者的底座，优先级低于用户已保存的覆盖。
 
 可用的环境变量：
 
@@ -78,7 +97,7 @@ session-map.json           对话 → 上游会话映射（免费车道配额按
 沿袭 wbBridge 的红线：
 
 - **上游是纯推理端点**：模型返回的 tool-calls 只是数据；执行、权限与结果始终在 DSH 这一侧。上游网关无从执行本地动作。
-- **不做任何本地监听**：没有子进程、没有回环端口、没有 Basic 认证；出站只有对两条车道网关的 HTTPS，TLS 校验不关闭。
+- **插件自己不监听任何端口**：没有子进程、没有 Basic 认证。设置 API 只是挂进 DSH 自带 web 服务的一个路由前缀，并且只接受回环来源与 `application/json`；出站只有对两条车道网关的 HTTPS，TLS 校验不关闭。
 - 免费车道的 `authorization` 是上游免费池的**公共池化凭据**（与 OpenCode 客户端自带的一致），不存在任何用户私有密钥；Kilo 车道完全不发送凭据。
 - 工具名在响应侧经可逆映射还原后才校验：不在调用方工具清单里的名字（含官方注入项）一律丢弃并告警，不会把未经检查的动作送进执行层。
 - 会话、请求、项目头的派生是确定性的，不携带任何宿主环境秘密；发往上流的系统提示词只包含插件自己的进程元数据（工作目录 / 平台 / 日期）。
@@ -92,6 +111,7 @@ session-map.json           对话 → 上游会话映射（免费车道配额按
 - 上游按出口 IP 计免费配额：一个烧掉的出口会以 429 + 小时级 `Retry-After` 回答；断路器会在窗口内本地拒绝，换出口即清窗。不支持配置出站代理。
 - Kilo 免费池由上游免费提供，其模型卡声明 prompt 可能被记录用于改进服务——请勿发送敏感内容。
 - 只发布免费模型。付费模型、需要用户自有 API Key 的供应商不会出现。
+- iPhone（Fish Pocket）上只有 Host 半身会运行：React 管理页要经 App 内的「探索 → 网页版」才看得到，原生侧能用的是设置表单里的两个开关与五个工具，详见 [在 iPhone 上用](#在-iphone-上用)。
 
 ## 开发
 

@@ -22,6 +22,8 @@ import { ROUTE, ROUTE_LABEL, AUTO_MODEL_ID, AUTO_MODEL_NAME } from './src/consta
 import { WbFreeModelAdapter } from './src/adapter.js'
 import { ModelService, ModelError } from './src/service.js'
 import { Store, resolveDataDir } from './src/store.js'
+import { createActions } from './src/actions.js'
+import { SETTINGS_NS, installNativeSurface } from './src/native.js'
 
 export const name = 'dsh-wb-free-model'
 export const inject = ['llm']
@@ -29,9 +31,8 @@ export { ROUTE, ROUTE_LABEL, AUTO_MODEL_ID, AUTO_MODEL_NAME }
 
 const API_PREFIX = '/api/wb-free-model'
 
-function settingsNamespace(ctx) {
-  return ctx.fiber?.entry?.options?.id ?? name
-}
+/** POST routes of the settings API; each maps to one shared lane action. */
+const ACTION_ROUTES = new Set(['refresh', 'probe', 'retry', 'settings'])
 
 function isLoopback(req) {
   const address = req.socket?.remoteAddress ?? ''
@@ -106,6 +107,11 @@ export function apply(ctx, config = {}) {
   const store = new Store({ dataDir, logger })
   const service = new ModelService({ store, config, logger, resolveImage: imageResolver(ctx, logger) })
   const adapter = new WbFreeModelAdapter({ service, logger })
+  // `setPreferences` belongs to the native surface installed at the end of this
+  // function. Every caller of it runs from a request or a tool call, never
+  // during loading, so the dispatcher can be built first.
+  let setPreferences
+  const actions = createActions({ service, store, logger, setPreferences: patch => setPreferences(patch) })
   let disposed = false
 
   try {
@@ -118,11 +124,11 @@ export function apply(ctx, config = {}) {
   const directoryEntries = [{
     provider: ROUTE,
     displayName: ROUTE_LABEL,
-    settingsNs: settingsNamespace(ctx),
+    settingsNs: SETTINGS_NS,
     settingsPath: [],
   }]
   const directory = ctx.llm.registerConfigurableProviders?.(directoryEntries)
-  ctx.llm.registerModelDiscovery?.(settingsNamespace(ctx), async (request, signal) => {
+  ctx.llm.registerModelDiscovery?.(SETTINGS_NS, async (request, signal) => {
     // This hook is the settings page's "interrogate one endpoint" offer (dsh-llm
     // calls `discover(request, signal)` with a draft endpoint description) — it
     // is NOT the selector's publication channel; that is adapter.listModels().
@@ -181,78 +187,13 @@ export function apply(ctx, config = {}) {
           return sendJSON(res, 415, { error: 'application/json required' })
         }
         const body = await readJSON(req)
-        const disabled = () => sendJSON(res, 409, {
-          started: false,
-          reason: 'disabled',
-          error: 'WB Free Model 已在设置里关闭',
-          code: 'CONFIG_DISABLED',
-          ...service.snapshot(),
-        })
-        if (route === '/refresh') {
-          if (!service.enabled) return disabled()
-          // Fire-and-forget like /probe: both upstream listings can be slow on
-          // a bad network day, far beyond a client's patience, and the
-          // connection must not decide whether the refresh finishes. Failures
-          // land in snapshot.lastError; clients poll /status.
-          void service.refreshCatalog()
-            .then(() => {
-              if (body.probe === true) return service.startProbes({ concurrency: body.concurrency })
-            })
-            .catch(() => {})
-          return sendJSON(res, 202, { started: true, ...service.snapshot() })
-        }
-        if (route === '/probe') {
-          if (!service.enabled) return disabled()
-          if (typeof body.id === 'string' && body.id !== '') {
-            if (service.isProbingModel(body.id)) {
-              return sendJSON(res, 409, { started: false, reason: 'in-flight', id: body.id, error: '该模型正在检测中', code: 'PROBE_IN_PROGRESS', ...service.snapshot() })
-            }
-            if (!service.canStartSingleProbe()) {
-              return sendJSON(res, 409, { started: false, reason: 'busy', id: body.id, error: '单模型检测并发已满，请稍后再试', code: 'PROBE_BUSY', ...service.snapshot() })
-            }
-            void service.probeOne(body.id).catch(error => {
-              logger.warn?.(`dsh-wb-free-model: single probe failed: ${error?.message ?? error}`)
-            })
-            return sendJSON(res, 202, { started: true, id: body.id, ...service.snapshot() })
-          }
-          if (service.probing) {
-            return sendJSON(res, 409, {
-              started: false,
-              reason: 'probing',
-              error: '已有检测在进行中，请等当前检测完成',
-              code: 'PROBE_IN_PROGRESS',
-              ...service.snapshot(),
-            })
-          }
-          void service.startProbes({ concurrency: body.concurrency }).catch(() => {})
-          return sendJSON(res, 202, { started: true, ...service.snapshot() })
-        }
-        if (route === '/retry') {
-          if (!service.enabled) return disabled()
-          if (typeof body.id === 'string' && body.id !== '') {
-            store.dropResult(body.id)
-            store.update({ disabled: store.get().disabled.filter(id => id !== body.id) })
-          } else {
-            for (const model of store.get().catalog) store.dropResult(model.id)
-            store.update({ disabled: [] })
-          }
-          await store.flush()
-          return sendJSON(res, 200, { ok: true, ...service.snapshot() })
-        }
-        if (route === '/settings') {
-          const patch = {}
-          if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
-          if (typeof body.probeOnBoot === 'boolean') patch.probeOnBoot = body.probeOnBoot
-          const wasEnabled = store.get().enabled !== false
-          store.update(patch)
-          await store.flush()
-          const isEnabled = store.get().enabled !== false
-          if (typeof body.enabled === 'boolean' && wasEnabled !== isEnabled) {
-            await toggleLane(isEnabled)
-          }
-          return sendJSON(res, 200, { ok: true, ...service.snapshot() })
-        }
-        return sendJSON(res, 404, { error: 'not found' })
+        const action = route.slice(1)
+        if (!ACTION_ROUTES.has(action)) return sendJSON(res, 404, { error: 'not found' })
+        // Refresh and probe start in the background and answer 202; clients
+        // poll /status, because an open connection must not decide whether the
+        // work finishes.
+        const { status, payload } = await actions.run(action, body)
+        return sendJSON(res, status, payload)
       } catch (error) {
         logger.warn?.(`dsh-wb-free-model: API ${req.method} ${req.url} failed: ${error?.message ?? error}`)
         sendJSON(res, error?.status ?? 500, { error: error?.message ?? String(error), code: error?.code ?? 'SERVER' })
@@ -331,4 +272,11 @@ export function apply(ctx, config = {}) {
       logger.warn?.(`dsh-wb-free-model: lane start failed: ${error?.message ?? error}`)
     })
   }
+
+  // ── surfaces a browser-less host can reach ───────────────────────────────────
+  // Fish Pocket runs this half and never runs `client.js`, so the switches and
+  // the actions exist here too: one settings namespace the app renders as a
+  // native form, and tools it can call in chat. Both drive `src/actions.js`,
+  // the same rules the routes above use, and both own the preference write.
+  setPreferences = installNativeSurface(ctx, { store, config, logger, actions, toggleLane }).setPreferences
 }
