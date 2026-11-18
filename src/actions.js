@@ -10,6 +10,7 @@
  */
 
 import { ModelError } from './service.js'
+import { excludedIds } from './store.js'
 
 /** What every surface says when the lane switch is off. */
 export const LANE_OFF_MESSAGE = 'WB Free Model 已在设置里关闭'
@@ -30,13 +31,17 @@ function laneOff(service) {
 
 /**
  * @param deps.service      - the model service every action drives.
- * @param deps.store        - persisted state, written directly by `/retry`.
+ * @param deps.store        - persisted state, written directly by the bin actions.
  * @param deps.logger       - where a background probe's failure is reported.
+ * @param deps.broadcast    - re-announces the adapter and provider directory. A
+ *                            tool caller has no page to refresh the selector, so
+ *                            the action that changes publication owns the
+ *                            announcement; the HTTP layer gets it for free.
  * @param deps.setPreferences - `(patch) => Promise`, owned by the host half so
  *                              that preference storage and its side effects stay
  *                              in one place.
  */
-export function createActions({ service, store, logger, setPreferences }) {
+export function createActions({ service, store, logger, broadcast, setPreferences }) {
   async function refresh({ probe, concurrency } = {}) {
     if (!service.enabled) return laneOff(service)
     // Fire-and-forget: both upstream listings can be slow on a bad network day,
@@ -44,7 +49,10 @@ export function createActions({ service, store, logger, setPreferences }) {
     // whether the refresh finishes. Failures land in snapshot.lastError.
     void service.refreshCatalog()
       .then(() => {
-        if (probe === true) return service.startProbes({ concurrency })
+        // A refresh can swap models in: re-derive the arm point, then optionally
+        // run a manual probe batch over the fresh catalog.
+        service.ensureCheckTimer()
+        if (probe === true) return service.startProbes({ concurrency, trigger: 'manual' })
         return undefined
       })
       .catch(() => {})
@@ -69,6 +77,23 @@ export function createActions({ service, store, logger, setPreferences }) {
       }
       void service.startProbes({ concurrency }).catch(() => {})
       return { status: 202, payload: { started: true, ...service.snapshot() } }
+    }
+    // Recycled/disabled models refuse probes with a coded 409. The page's inline
+    // retry never sends these; the guard keeps stale clients, hand-typed chat ids
+    // and races honest, and it backs the same check inside probeOne.
+    if (excludedIds(store.get()).has(modelId)) {
+      const recycled = store.get().recycled.includes(modelId)
+      return {
+        status: 409,
+        payload: {
+          started: false,
+          reason: recycled ? 'recycled' : 'disabled',
+          id: modelId,
+          error: recycled ? '该模型已移入回收站，请先恢复再检测' : '该模型已被禁用，无法检测',
+          code: recycled ? 'RECYCLED' : 'DISABLED',
+          ...service.snapshot(),
+        },
+      }
     }
     if (service.isProbingModel(modelId)) {
       return {
@@ -105,14 +130,101 @@ export function createActions({ service, store, logger, setPreferences }) {
   async function retry({ id } = {}) {
     if (!service.enabled) return laneOff(service)
     if (typeof id === 'string' && id !== '') {
+      if (store.get().recycled.includes(id)) {
+        return {
+          status: 409,
+          payload: {
+            started: false,
+            reason: 'recycled',
+            id,
+            error: '该模型已移入回收站，请先恢复再重试',
+            code: 'RECYCLED',
+            ...service.snapshot(),
+          },
+        }
+      }
       store.dropResult(id)
       store.update({ disabled: store.get().disabled.filter(entry => entry !== id) })
     } else {
+      // The full clear keeps the recycle bin: a recycled model must not silently
+      // re-enter the selector because probe results were reset.
       for (const model of store.get().catalog) store.dropResult(model.id)
       store.update({ disabled: [] })
     }
     await store.flush()
+    // Un-disabled models re-enter the selector only via a replace broadcast: the
+    // same re-query republishes models whose results just dropped.
+    broadcast?.()
+    service.ensureCheckTimer()
     return { status: 200, payload: { ok: true, ...service.snapshot() } }
+  }
+
+  /**
+   * Move one model into the recycle bin — system-driven exclusion, unlike
+   * `disabled`, which is the user's plain veto.
+   *
+   * Deliberately not gated on the lane switch: the bin is viewable and operable
+   * while the lane is off (`snapshot.recycled` keeps returning catalog entries).
+   * Safety comes from `ensureCheckTimer`, which refuses to arm while disabled, so
+   * a restored model is only picked up once the lane starts again.
+   */
+  async function recycle({ id } = {}) {
+    const rejection = knownModel(id)
+    if (rejection !== undefined) return rejection
+    if (service.isProbingModel(id)) {
+      return {
+        status: 409,
+        payload: {
+          started: false,
+          reason: 'in-flight',
+          id,
+          error: '该模型正在检测中，请等当前检测完成',
+          code: 'PROBE_IN_PROGRESS',
+          ...service.snapshot(),
+        },
+      }
+    }
+    store.update({
+      recycled: [...store.get().recycled.filter(entry => entry !== id), id],
+      disabled: store.get().disabled.filter(entry => entry !== id),
+    })
+    // The failure evidence stays: the record explains why the model is in the bin
+    // and what a restore will clear.
+    await store.flush()
+    // Selector removal is driven solely by replace broadcasts; without this the
+    // recycled model lingers there until the next lane toggle.
+    broadcast?.()
+    service.ensureCheckTimer()
+    return { status: 200, payload: { ok: true, id, ...service.snapshot() } }
+  }
+
+  /** Take one model out of the bin and put it back on the probe queue. */
+  async function restore({ id } = {}) {
+    const rejection = knownModel(id)
+    if (rejection !== undefined) return rejection
+    store.update({
+      recycled: store.get().recycled.filter(entry => entry !== id),
+      disabled: store.get().disabled.filter(entry => entry !== id),
+    })
+    // Back to "never probed": a kept failure record would hide the restored model
+    // from the selector (failures are not published) and its stale evidence would
+    // pollute the fresh start.
+    store.dropResult(id)
+    await store.flush()
+    broadcast?.()
+    service.ensureCheckTimer()
+    return { status: 200, payload: { ok: true, id, ...service.snapshot() } }
+  }
+
+  /** Both bin actions address one existing catalog entry, whatever the lane state. */
+  function knownModel(id) {
+    if (typeof id !== 'string' || id === '' || service.resolveEntry(id) === undefined) {
+      return {
+        status: 404,
+        payload: { error: `未知模型 "${typeof id === 'string' ? id : ''}"`, code: 'MODEL_NOT_FOUND', ...service.snapshot() },
+      }
+    }
+    return undefined
   }
 
   async function settings(body) {
@@ -133,6 +245,8 @@ export function createActions({ service, store, logger, setPreferences }) {
     if (route === 'refresh') return refresh(body)
     if (route === 'probe') return probe(body)
     if (route === 'retry') return retry(body)
+    if (route === 'recycle') return recycle(body)
+    if (route === 'restore') return restore(body)
     if (route === 'settings') return settings(body)
     throw new ModelError(`unknown action "${route}"`, { code: 'NOT_FOUND', status: 404 })
   }

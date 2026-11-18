@@ -31,9 +31,6 @@ export { ROUTE, ROUTE_LABEL, AUTO_MODEL_ID, AUTO_MODEL_NAME }
 
 const API_PREFIX = '/api/wb-free-model'
 
-/** POST routes of the settings API; each maps to one shared lane action. */
-const ACTION_ROUTES = new Set(['refresh', 'probe', 'retry', 'settings'])
-
 function isLoopback(req) {
   const address = req.socket?.remoteAddress ?? ''
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
@@ -107,11 +104,17 @@ export function apply(ctx, config = {}) {
   const store = new Store({ dataDir, logger })
   const service = new ModelService({ store, config, logger, resolveImage: imageResolver(ctx, logger) })
   const adapter = new WbFreeModelAdapter({ service, logger })
-  // `setPreferences` belongs to the native surface installed at the end of this
-  // function. Every caller of it runs from a request or a tool call, never
-  // during loading, so the dispatcher can be built first.
+  // One implementation for every lane action (src/actions.js), shared by the web
+  // API and the Host-side surfaces; only the presentation differs.
+  const ACTION_ROUTES = new Set(['refresh', 'probe', 'retry', 'recycle', 'restore', 'settings'])
   let setPreferences
-  const actions = createActions({ service, store, logger, setPreferences: patch => setPreferences(patch) })
+  const actions = createActions({
+    service,
+    store,
+    logger,
+    broadcast,
+    setPreferences: patch => setPreferences(patch),
+  })
   let disposed = false
 
   try {
@@ -227,26 +230,45 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** The existing start path, shared by boot and re-enabling: refresh → probes → publish. */
+  /**
+   * The existing start path, shared by boot and re-enabling: refresh → arm →
+   * probes per probeOnBoot → publish.
+   */
   async function startLane() {
-    await service.refreshCatalog()
+    try {
+      await service.refreshCatalog()
+    } finally {
+      // Arming must not depend on the refresh succeeding: a failed start
+      // throws into boot/enableLane's catch (which swallows it), and without
+      // this the 24h maintenance would never arm for the session.
+      if (!disposed && service.enabled) service.ensureCheckTimer()
+    }
     if (disposed || !service.enabled) return
+    // probeOnBoot=false: no immediate probes at all — the armed cadence picks
+    // due models up within the spread window (≤15 minutes).
     if (store.get().probeOnBoot === false) {
-      logger.info?.('dsh-wb-free-model: boot probe disabled in settings')
+      logger.info?.('dsh-wb-free-model: boot probe disabled in settings; the 24h cadence takes over')
       return
     }
-    // Freshness counts probe outcomes only: a request success from a previous
-    // session must not mask models that were never (or adversely) probed.
+    // First boot for this state (no probe evidence anywhere): probe everything
+    // right now so the selector is populated immediately instead of trickling
+    // in over hours. Failures count as scheduled evidence, same as the
+    // cadence; the boot round advances checkedAt like any scheduled check.
     const probed = Object.values(store.get().results).filter(result => result?.source === 'probe')
-    const newest = probed.length === 0 ? 0 : Math.max(...probed.map(result => Number(result?.at ?? 0)))
-    const fresh = probed.length > 0 && Date.now() - newest < 12 * 60 * 60 * 1000
-    const anyPassed = probed.some(result => result?.ok === true)
-    if (fresh && anyPassed) return
-    // Probes are sequential, rate-limited completions; two workers keep the
-    // boot responsive without hammering either gateway.
-    void service.startProbes({ concurrency: config.probeConcurrency ?? 2 }).catch(error => {
-      logger.warn?.(`dsh-wb-free-model: boot probe failed: ${error?.message ?? error}`)
-    })
+    if (probed.length === 0) {
+      void service.startProbes({ concurrency: config.probeConcurrency ?? 2, trigger: 'scheduled' }).catch(error => {
+        logger.warn?.(`dsh-wb-free-model: boot probe failed: ${error?.message ?? error}`)
+      })
+      return
+    }
+    // Otherwise arm only: due models enter the trickle (2 per 15 minutes)
+    // instead of a full re-probe on every restart. Log the throttle decision —
+    // no probe fires on this path, so without a line here the behavior is
+    // only visible through the status API.
+    const dueCount = service.dueModels().length
+    const totalCount = store.get().catalog.length
+    const nextAt = typeof service.checkAt === 'number' ? new Date(service.checkAt).toISOString() : 'none'
+    logger.info?.(`dsh-wb-free-model: boot maintenance armed: ${totalCount - dueCount} fresh, ${dueCount} due; next check at ${nextAt}`)
   }
 
   // Toggle side effects run one at a time so rapid double-toggles can never

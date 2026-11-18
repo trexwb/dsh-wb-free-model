@@ -18,7 +18,7 @@
   "x-ecosystem-packaging": {
     "adapterIsolation": "src/adapter.js is the only module that talks to the DSH llm service; src/native.js reaches ctx.settings and ctx.tools, and the only @deepseek-ai/* import in the package is the schemastery schema builder.",
     "runtime": "Both keyless lanes are reached directly over HTTPS from the plugin process; there is no runtime download, child process or local port. The free lane's v2 wire contract is carried verbatim in src/o2a/ from dsh-our-free-model (MIT).",
-    "ios": "Host-only by design: the browser half never runs in Fish Pocket, so lane preferences are a settings namespace the native form renders and lane actions are tools. src/actions.js is the single implementation shared with the web API.",
+    "ios": "Host-only by design: the browser half never runs in Fish Pocket, so lane preferences are a settings namespace the native form renders and lane actions — including the recycle bin — are tools. src/actions.js is the single implementation shared with the web API.",
     "provenance": "业务逻辑移植自 https://github.com/trexwb/wbBridge；线契约收录自 https://github.com/Ebony-Vinyl/dsh-our-free-model"
   }
 }

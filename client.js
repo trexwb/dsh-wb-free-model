@@ -5,6 +5,11 @@
  * state, plus the plugin's own switches. Data comes from the host half's
  * same-origin `/api/wb-free-model/*` routes; no typed binding is assumed so the
  * page mounts on every DSH kernel line this plugin targets.
+ *
+ * The section paints its own light card (near-white background, dark text,
+ * light separators) instead of inheriting the host theme's variables, so it
+ * stays readable when DSH runs in dark mode. The palette is scoped to this
+ * panel only — no global theme is touched.
  */
 
 window.__ModuleLoader__.load({
@@ -32,6 +37,9 @@ window.__ModuleLoader__.load({
         if (!response.ok) {
           const error = new Error(payload?.error ?? `HTTP ${response.status}`)
           error.status = response.status
+          // Coded 409s (RECYCLED / DISABLED / PROBE_IN_PROGRESS / …) let
+          // callers react precisely instead of aborting a whole batch.
+          error.code = typeof payload?.code === 'string' ? payload.code : undefined
           throw error
         }
         return payload
@@ -52,7 +60,8 @@ window.__ModuleLoader__.load({
      * Retry the failed models one POST at a time. The server caps single-model
      * probes at `probeConcurrency`, so a burst larger than that must wait for a
      * free slot instead of piling into 409s and aborting mid-list. A 409 that
-     * still slips through a race gets one delayed retry.
+     * still slips through a race gets one delayed retry; a coded 409 for a
+     * recycled/disabled model is a permanent refusal — skip it and keep going.
      */
     async function retryFailedModels(ids, { post, getStatus, limit = 2, waitMs = 500, maxWaits = 40 }) {
       for (const id of ids) {
@@ -67,6 +76,7 @@ window.__ModuleLoader__.load({
         try {
           await post('/probe', { id })
         } catch (error) {
+          if (error?.status === 409 && (error?.code === 'RECYCLED' || error?.code === 'DISABLED')) continue
           if (error?.status !== 409) throw error
           await delay(800)
           await post('/probe', { id })
@@ -74,16 +84,27 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // Fixed light palette: near-white cards, dark text, light separators.
     const COLORS = {
-      text: 'var(--vscode-foreground, #1f2328)',
-      muted: 'var(--vscode-descriptionForeground, #656d76)',
-      border: 'var(--vscode-panel-border, rgba(128,128,128,0.28))',
-      panel: 'var(--vscode-sideBar-background, transparent)',
-      accent: 'var(--vscode-button-background, #2563eb)',
-      accentText: 'var(--vscode-button-foreground, #fff)',
-      ok: 'var(--vscode-testing-iconPassed, #1a7f37)',
-      warn: 'var(--vscode-editorWarning-foreground, #9a6700)',
-      bad: 'var(--vscode-errorForeground, #cf222e)',
+      text: '#1f2328',
+      muted: '#57606a',
+      border: 'rgba(31,35,40,0.18)',
+      softBorder: 'rgba(31,35,40,0.09)',
+      panel: '#ffffff',
+      panelAlt: '#f6f8fa',
+      accent: '#2563eb',
+      accentText: '#ffffff',
+      ok: '#1a7f37',
+      warn: '#9a6700',
+      bad: '#cf222e',
+      warnBanner: '#fff8e1',
+      warnBorder: 'rgba(154,103,0,0.35)',
+    }
+
+    const CARD = {
+      background: COLORS.panel,
+      border: `1px solid ${COLORS.border}`,
+      borderRadius: 8,
     }
 
     function Tag({ label, tone }) {
@@ -92,6 +113,7 @@ window.__ModuleLoader__.load({
         style: {
           display: 'inline-block', padding: '1px 6px', marginRight: 6, borderRadius: 4,
           border: `1px solid ${COLORS.border}`, color, fontSize: 11, whiteSpace: 'nowrap',
+          background: COLORS.panel,
         },
       }, label)
     }
@@ -104,7 +126,7 @@ window.__ModuleLoader__.load({
         style: {
           padding: '4px 10px', marginRight: 8, borderRadius: 5, cursor: disabled ? 'default' : 'pointer',
           border: `1px solid ${primary ? COLORS.accent : COLORS.border}`,
-          background: primary ? COLORS.accent : 'transparent',
+          background: primary ? COLORS.accent : COLORS.panel,
           color: primary ? COLORS.accentText : COLORS.text,
           opacity: disabled ? 0.55 : 1, fontSize: 12,
         },
@@ -115,7 +137,11 @@ window.__ModuleLoader__.load({
       const result = model.result
       if (result?.ok === true && result?.chatOnly === true) return { label: '仅对话', tone: 'warn' }
       if (result?.ok === true) return { label: '可用', tone: 'ok' }
-      if (result?.source === 'probe' && result?.ok === false) return { label: '探测失败', tone: 'bad' }
+      const streak = Number(model.failStreak ?? 0)
+      const streakNote = streak >= 2 ? ` · 连败 ${streak}` : ''
+      if (result?.source === 'probe' && result?.ok === false) return { label: `探测失败${streakNote}`, tone: 'bad' }
+      if (result?.ok === false && result?.state === 'limited') return { label: `受限${streakNote}`, tone: 'warn' }
+      if (result?.ok === false && result?.state === 'down') return { label: `不可用${streakNote}`, tone: 'bad' }
       if (result?.ok === false) return { label: '最近请求失败', tone: 'warn' }
       return { label: '未探测', tone: 'muted' }
     }
@@ -127,16 +153,29 @@ window.__ModuleLoader__.load({
       return '运行「检测全部」或点这一行的重试'
     }
 
+    function checkTimes(model) {
+      const last = Number(model.lastCheckAt ?? 0)
+      const next = Number(model.nextCheckAt ?? 0)
+      return `上次检测 ${last > 0 ? new Date(last).toLocaleString() : '从未'} · 下次自动检测 ${next > 0 ? new Date(next).toLocaleString() : '待检测'}`
+    }
+
     function Row({ model, busy, onProbe }) {
       const state = availability(model)
       const capabilities = []
       if (model.toolcall === true) capabilities.push(h(Tag, { key: 't', label: '工具' }))
       if (model.images === true) capabilities.push(h(Tag, { key: 'i', label: '图像' }))
       if (model.reasoning === true) capabilities.push(h(Tag, { key: 'r', label: '推理' }))
+      if (model.disabled === true) capabilities.push(h(Tag, { key: 'dis', label: '已禁用', tone: 'muted' }))
+      // Recycled models never appear in models[] (the snapshot filters them
+      // out; they render in the recycle-bin block below). A disabled row
+      // cannot act at all — its probe request would be a guaranteed 409.
+      const action = model.disabled === true
+        ? h(Button, { key: 'action', disabled: true }, '已被禁用')
+        : h(Button, { key: 'action', onClick: () => onProbe(model.id), disabled: busy }, busy ? '检测中…' : '重试')
       return h('div', {
         style: {
           display: 'grid', gridTemplateColumns: 'minmax(180px, 1.3fr) minmax(120px, 1fr) auto',
-          gap: 10, alignItems: 'center', padding: '7px 0', borderTop: `1px solid ${COLORS.border}`,
+          gap: 10, alignItems: 'center', padding: '7px 0', borderTop: `1px solid ${COLORS.softBorder}`,
         },
       },
         h('div', null,
@@ -146,8 +185,9 @@ window.__ModuleLoader__.load({
             model.efforts?.length > 0 ? h(Tag, { label: `档位 ${model.efforts.join('/')}` }) : null)),
         h('div', null,
           h('div', null, h(Tag, { label: state.label, tone: state.tone }), h('span', { style: { fontSize: 11, color: COLORS.muted } }, `权重 ${model.weight ?? 100}`)),
-          h('div', { style: { fontSize: 11, color: COLORS.muted, marginTop: 2, wordBreak: 'break-word' } }, modelDetail(model))),
-        h(Button, { onClick: () => onProbe(model.id), disabled: busy }, busy ? '检测中…' : '重试'),
+          h('div', { style: { fontSize: 11, color: COLORS.muted, marginTop: 2, wordBreak: 'break-word' } }, modelDetail(model)),
+          h('div', { style: { fontSize: 11, color: COLORS.muted, marginTop: 2 } }, checkTimes(model))),
+        action,
       )
     }
 
@@ -186,6 +226,7 @@ window.__ModuleLoader__.load({
       const { status, data, error, reload } = useStatus()
       const [busy, setBusy] = useState('')
       const [note, setNote] = useState(null)
+      const [binOpen, setBinOpen] = useState(false)
 
       const run = useCallback(async (key, action, done = '') => {
         setBusy(key)
@@ -212,7 +253,10 @@ window.__ModuleLoader__.load({
 
       const laneEnabled = data?.enabled !== false
       const models = data?.models ?? []
-      const failed = models.filter(model => model.result?.source === 'probe' && model.result?.ok === false)
+      // Recycled rows refuse probes with a coded 409 — never queue them.
+      const failed = models.filter(model => model.result?.source === 'probe' && model.result?.ok === false && model.recycled !== true)
+      const suggestions = data?.recycleSuggestions ?? []
+      const recycledItems = data?.recycled ?? []
       const refreshing = data?.refreshing === true
       const quotaActive = Number(data?.laneQuotaUntil ?? 0) > Date.now()
       const runtimeLine = (() => {
@@ -223,7 +267,17 @@ window.__ModuleLoader__.load({
         return data.lastError || '尚未拉到模型清单，点「刷新目录」开始'
       })()
 
-      return h('div', { style: { color: COLORS.text, fontSize: 13, lineHeight: 1.5, maxWidth: 860 } },
+      return h('div', {
+        style: {
+          ...CARD,
+          color: COLORS.text,
+          fontSize: 13,
+          lineHeight: 1.5,
+          maxWidth: 860,
+          padding: '12px 14px',
+          marginBottom: 8,
+        },
+      },
         h('h3', { style: { margin: '0 0 4px' } }, 'WB Free Model'),
         h('div', { style: { color: COLORS.muted, marginBottom: 10 } },
           '免费模型由插件进程直连上游免费网关（OpenCode 的免密免费车道与 Kilo 公共池），不需要登录、注册或填写任何 API Key，也不下载任何运行时。选「WB · auto」会按耗时权重自动挑一个当前可用的模型。'),
@@ -231,11 +285,11 @@ window.__ModuleLoader__.load({
           ? h('div', {
               style: {
                 padding: '8px 10px', marginBottom: 10, borderRadius: 6,
-                border: `1px solid ${COLORS.border}`, background: COLORS.panel,
-                fontSize: 12, color: COLORS.muted,
+                border: `1px solid ${COLORS.border}`, background: COLORS.panelAlt,
+                fontSize: 12, color: COLORS.text,
               },
             },
-            'WB Free Model 已停用：全部模型（含 WB · auto）已从模型选择器移除，探测与目录刷新已暂停，重启后也不会自动拉起。勾选下方「启用 WB Free Model 车道」即可重新开启。')
+            'WB Free Model 已停用：全部模型（含 WB · auto）已从模型选择器移除，探测与目录刷新已暂停，重启后也不会自动拉起。勾选下方「启用 WB Free Model 车道」即可重新开启。回收站仍可在下方查看与恢复。')
           : null,
         data !== undefined && laneEnabled && quotaActive
           ? h('div', {
@@ -304,11 +358,39 @@ window.__ModuleLoader__.load({
               onChange: event => run('boot', () => post('/settings', { probeOnBoot: event.target.checked }), '设置已保存'),
             }),
             '启动时自动检测模型')),
-        data?.catalogAt && laneEnabled ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginBottom: 4 } },
+        data?.catalogAt && laneEnabled ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginBottom: 2 } },
           `目录更新于 ${new Date(data.catalogAt).toLocaleString()} · 共 ${models.length} 个免费模型`) : null,
+        data !== undefined && laneEnabled
+          ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginBottom: 4 } },
+              `自动检测节拍：每模型每 24h 至多一次；到期后按 ${data.maintenance?.batchSize ?? 2} 个/15 分钟排队补检，忙时顺延不跳过。`)
+          : null,
         status === 'loading' ? h('div', { style: { color: COLORS.muted } }, '加载中…') : null,
         models.length === 0 && status === 'ready' && laneEnabled
           ? h('div', { style: { color: COLORS.warn, marginTop: 8 } }, '还没有发现免费模型。点「刷新目录」重试；若持续失败，看上面的状态说明。')
+          : null,
+        suggestions.length > 0 && laneEnabled
+          ? h('div', {
+              style: {
+                padding: '8px 10px', marginTop: 8, borderRadius: 6,
+                border: `1px solid ${COLORS.warnBorder}`, background: COLORS.warnBanner,
+                fontSize: 12,
+              },
+            },
+            h('div', { style: { fontWeight: 600, marginBottom: 4 } }, '建议移入回收站'),
+            h('div', { style: { color: COLORS.muted, marginBottom: 6 } },
+              `这些模型连续 ${data?.recycleThreshold ?? 3} 个 24h 周期的自动检测都失败，且期间没有任何成功。移入后会从模型选择器移除并停止自动检测，随时可恢复。`),
+            ...suggestions.map(item => h('div', {
+              key: item.id,
+              style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '6px 0', borderTop: `1px solid ${COLORS.softBorder}` },
+            },
+              h('span', { style: { fontWeight: 600 } }, item.name),
+              h('span', { style: { fontSize: 11, color: COLORS.muted } }, `连续失败 ${item.checkFails} 个周期`),
+              h('span', { style: { fontSize: 11, color: COLORS.bad, wordBreak: 'break-word' } }, item.message ?? ''),
+              h('span', { style: { flex: 1 } }),
+              h(Button, {
+                disabled: busy !== '',
+                onClick: () => run(`recycle:${item.id}`, () => post('/recycle', { id: item.id }), '已移入回收站，可随时在下方回收站恢复'),
+              }, '移入回收站'))))
           : null,
         models.length > 0 && data?.auto !== undefined
           ? h('div', { style: { marginTop: 8, padding: '7px 0', borderTop: `1px solid ${COLORS.border}` } },
@@ -328,6 +410,36 @@ window.__ModuleLoader__.load({
             || (Array.isArray(data?.probingIds) && data.probingIds.includes(model.id)),
           onProbe: id => run(`probe:${id}`, () => post('/probe', { id }), '已开始重试，几秒后刷新状态'),
         })),
+        recycledItems.length > 0
+          ? h('div', {
+              style: {
+                background: COLORS.panelAlt, border: `1px solid ${COLORS.border}`,
+                borderRadius: 6, padding: '8px 10px', marginTop: 12,
+              },
+            },
+            h('div', {
+              onClick: () => setBinOpen(open => !open),
+              style: { cursor: 'pointer', fontWeight: 600, fontSize: 13, userSelect: 'none' },
+            }, `回收站（${recycledItems.length}）${binOpen ? '▾' : '▸'}`),
+            binOpen ? h('div', { style: { marginTop: 6 } },
+              h('div', { style: { fontSize: 11, color: COLORS.muted, marginBottom: 4 } },
+                '这些模型已从上方模型列表与模型选择器移除，并停止自动检测；恢复后回到模型列表的未探测状态，会在 ≤15 分钟内被自动复检。'),
+              ...recycledItems.map(item => h('div', {
+                key: item.id,
+                style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '6px 0', borderTop: `1px solid ${COLORS.softBorder}` },
+              },
+                h('span', { style: { fontWeight: 600 } }, item.name),
+                h('span', { style: { fontSize: 11, color: COLORS.muted } }, `连败 ${item.failStreak ?? 0}`),
+                h('span', { style: { fontSize: 11, color: COLORS.muted, wordBreak: 'break-word' } }, item.message ?? ''),
+                typeof item.at === 'number' && item.at > 0
+                  ? h('span', { style: { fontSize: 11, color: COLORS.muted } }, new Date(item.at).toLocaleString())
+                  : null,
+                h('span', { style: { flex: 1 } }),
+                h(Button, {
+                  disabled: busy !== '',
+                  onClick: () => run(`restore:${item.id}`, () => post('/restore', { id: item.id }), '已恢复：该模型回到未探测状态，会在 ≤15 分钟内被自动复检'),
+                }, '恢复')))) : null)
+          : null,
         models.length > 0 ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginTop: 12 } },
           '工具调用的执行始终发生在 DSH 这一侧；上游网关只生成文本与动作请求，不会执行任何本地操作。') : null,
       )

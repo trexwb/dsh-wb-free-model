@@ -40,6 +40,16 @@ function ago(at) {
   return `${Math.round(hours / 24)} 天前`
 }
 
+/** The other direction of `ago`: when something scheduled will fire. */
+function inTime(at) {
+  const minutes = Math.round((at - Date.now()) / 60_000)
+  if (minutes <= 0) return '即将'
+  if (minutes < 60) return `${minutes} 分钟后`
+  const hours = Math.round(minutes / 60)
+  if (hours < 48) return `${hours} 小时后`
+  return `${Math.round(hours / 24)} 天后`
+}
+
 /** One snapshot as the lines a chat answer needs; `detail` adds the model table. */
 export function renderStatus(snapshot, detail) {
   const lines = []
@@ -48,7 +58,18 @@ export function renderStatus(snapshot, detail) {
   lines.push(`目录：${snapshot.enabled === true ? snapshot.models.length : 0} 个模型，最近刷新 ${ago(snapshot.catalogAt)}${snapshot.refreshing === true ? '（正在刷新）' : ''}`)
   if (Array.isArray(snapshot.probingIds) && snapshot.probingIds.length > 0) {
     const progress = snapshot.probeProgress
-    lines.push(`检测中：${snapshot.probingIds.length} 个${progress ? `，本批 ${progress.done()}/${progress.total}` : ''}`)
+    lines.push(`检测中：${snapshot.probingIds.length} 个${progress ? `，本批 ${progress.done}/${progress.total}` : ''}`)
+  }
+  const suggestions = snapshot.recycleSuggestions ?? []
+  if (suggestions.length > 0) {
+    lines.push(`建议移入回收站（连续 ${snapshot.recycleThreshold ?? '多'} 次自动检测失败）：${suggestions.map(entry => `${entry.name}（${entry.id}）`).join('、')}`)
+  }
+  if (Array.isArray(snapshot.recycled) && snapshot.recycled.length > 0) {
+    lines.push(`回收站：${snapshot.recycled.length} 个（${snapshot.recycled.map(entry => entry.id).join('、')}）`)
+  }
+  const maintenance = snapshot.maintenance
+  if (maintenance !== undefined) {
+    lines.push(`24 小时检修：${snapshot.checkArmed === true ? '已排期' : '未排期'}，待检 ${maintenance.due ?? 0} 个${typeof maintenance.nextCheckAt === 'number' && maintenance.nextCheckAt > 0 ? `，下次 ${inTime(maintenance.nextCheckAt)}` : ''}`)
   }
   if (typeof snapshot.laneQuotaUntil === 'number' && snapshot.laneQuotaUntil > Date.now()) {
     lines.push(`免费车道配额窗口：${new Date(snapshot.laneQuotaUntil).toISOString()} 前本地直接拒绝新请求${snapshot.laneQuotaMessage ? `（${snapshot.laneQuotaMessage}）` : ''}`)
@@ -64,9 +85,12 @@ export function renderStatus(snapshot, detail) {
     const unprobed = snapshot.models.filter(model => model.result === undefined)
     lines.push(`可调用工具 ${usable.length} / 仅对话 ${chatOnly.length} / 失败 ${failed.length} / 未检测 ${unprobed.length}`)
     for (const model of snapshot.models) {
-      const mark = model.result?.ok !== true ? '失败' : model.result?.chatOnly === true ? '仅对话' : '可用'
+      const mark = model.result === undefined ? '未检测' : model.result.ok !== true ? '失败' : model.result.chatOnly === true ? '仅对话' : '可用'
       const reason = model.result?.ok === false ? `：${model.result.message ?? model.result.code ?? '未知原因'}` : ''
-      lines.push(`- ${model.name}（${model.id}） · ${mark} · 权重 ${model.weight ?? 0} · 最近 ${seconds(model.result?.ms)}${reason}`)
+      // `state` is the health state machine (ok / limited / down, absent without
+      // evidence); it explains a low weight even where the last probe passed.
+      const health = model.state === undefined ? '' : ` · 健康 ${model.state}${model.failStreak > 0 ? `×${model.failStreak}` : ''}`
+      lines.push(`- ${model.name}（${model.id}） · ${mark}${model.disabled === true ? ' · 已禁用' : ''} · 权重 ${model.weight ?? 0}${health} · 最近 ${seconds(model.result?.ms)}${reason}`)
     }
   } else if (snapshot.enabled === true) {
     lines.push('如需逐个模型的状态与耗时，用 detail="models" 再查一次。')
@@ -175,12 +199,15 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
    * Chat has no list to tap, so an id the lane does not serve must be answered
    * as such before anything starts: the routes tolerate a background probe
    * whose failure only ever reaches the settings page, and a tool that replies
-   * 「已开始」 to a typo would be lying.
+   * 「已开始」 to a typo would be lying. The recycle bin counts as known — its
+   * whole point is to be addressable while hidden from the selector.
    */
   function unknownId(snapshot, id) {
-    return id !== undefined && !snapshot.models.some(model => model.id === id)
-      ? `车道里没有 id 为 "${id}" 的模型。用 wb_free_model_status 的 detail="models" 列出可用 id。`
-      : undefined
+    if (id === undefined) return undefined
+    const known = [...snapshot.models, ...(snapshot.recycled ?? [])].some(model => model.id === id)
+    return known
+      ? undefined
+      : `车道里没有 id 为 "${id}" 的模型。用 wb_free_model_status 的 detail="models" 列出可用 id。`
   }
 
   const probeTool = {
@@ -223,6 +250,49 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
   }
 
+  /**
+   * The recycle bin is the one surface that works while the lane is off, so
+   * these two deliberately skip the `enabled` pre-check the other id-taking
+   * tools run; `actions` rejects only an id the catalog never had.
+   */
+  const recycleTool = {
+    name: 'wb_free_model_recycle',
+    description: '把一个 WB 免费模型移入回收站：不再发布、不再自动检测，可以随时恢复。用于状态里「建议移入回收站」的模型。',
+    parameters: {
+      id: { type: 'string', description: '要回收的模型 id（wb_free_model_status 的 detail="models" 每行括号里那个）。' },
+    },
+    output: textOutput,
+    async execute(args) {
+      const id = typeof args.id === 'string' ? args.id : ''
+      if (id === '') return '需要指定模型 id；用 wb_free_model_status 的 detail="models" 列出可用 id。'
+      const rejection = unknownId((await actions.run('status')).payload, id)
+      if (rejection !== undefined) return rejection
+      const { status, payload } = await actions.run('recycle', { id })
+      if (status !== 200) return `未能移入回收站：${payload.error ?? '该模型正在检测中'}`
+      return `已把 ${id} 移入回收站：不再出现在模型选择器里，也不参与 WB · auto。用 wb_free_model_restore 恢复。`
+    },
+  }
+
+  const restoreTool = {
+    name: 'wb_free_model_restore',
+    description: '把一个 WB 免费模型从回收站恢复，并清掉它的失败记录（回到未检测）。',
+    parameters: {
+      id: { type: 'string', description: '要恢复的模型 id；回收站清单见 wb_free_model_status。' },
+    },
+    output: textOutput,
+    async execute(args) {
+      const id = typeof args.id === 'string' ? args.id : ''
+      if (id === '') return '需要指定模型 id；wb_free_model_status 的「回收站」一行列出了里面的 id。'
+      const rejection = unknownId((await actions.run('status')).payload, id)
+      if (rejection !== undefined) return rejection
+      const { status, payload } = await actions.run('restore', { id })
+      if (status !== 200) return `未能恢复：${payload.error ?? '未知模型'}`
+      // An unprobed model is published; only a probe *failure* hides it, so
+      // clearing the record is what puts it back in the selector.
+      return `已把 ${id} 移出回收站并清掉失败记录：模型重新可选（状态回到未检测）。要确认可用性，用 wb_free_model_probe 带上这个 id。`
+    },
+  }
+
   const settingsTool = {
     name: 'wb_free_model_settings',
     description: '开启或关闭 WB 免费模型车道，或设置启动时是否自动检测。等价于设置页的两个开关。',
@@ -242,8 +312,9 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
   }
 
   ctx.inject(['tools'], scoped => {
-    for (const tool of [statusTool, refreshTool, probeTool, retryTool, settingsTool]) scoped.tools.register(tool)
-    logger.info?.('dsh-wb-free-model: lane tools registered (status/refresh/probe/retry/settings)')
+    const tools = [statusTool, refreshTool, probeTool, retryTool, recycleTool, restoreTool, settingsTool]
+    for (const tool of tools) scoped.tools.register(tool)
+    logger.info?.(`dsh-wb-free-model: ${tools.length} lane tools registered (status/refresh/probe/retry/recycle/restore/settings)`)
   })
 
   return { setPreferences }

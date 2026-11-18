@@ -248,6 +248,84 @@ export function replayStream(head) {
 }
 
 /**
+ * Read an SSE body and dispatch each event's `data:` payload to `onData`, in
+ * order. The deadline is idle-based: every chunk resets it, so a long answer
+ * is fine but a silent connection is not. Multi-line `data:` fields are joined
+ * with newlines; comments and the `event:`/`id:`/`retry:` fields are skipped.
+ */
+export async function readSse(stream, onData, signal, timeoutMs = 300_000) {
+  const decoder = new TextDecoder()
+  const iterator = stream[Symbol.asyncIterator]()
+  let buffer = ''
+  let data = []
+  let deadline = Date.now() + timeoutMs
+  const dispatch = () => {
+    if (data.length === 0) return
+    const payload = data.join('\n')
+    data = []
+    onData(payload)
+  }
+  const cancel = () => {
+    const done = iterator.return?.()
+    if (done !== undefined) done.catch(() => {})
+    const extra = stream.cancel?.()
+    if (extra !== undefined) extra.catch?.(() => {})
+  }
+  const onAbort = () => cancel()
+  signal?.addEventListener('abort', onAbort, { once: true })
+  let timer
+  try {
+    while (true) {
+      if (signal?.aborted === true) throw new UpstreamError('request aborted', CODE.aborted)
+      const pending = iterator.next()
+      pending.catch(() => {})
+      let row
+      try {
+        row = await Promise.race([
+          pending,
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new UpstreamError('upstream stream went idle past its deadline', CODE.timeout)),
+              Math.max(0, deadline - Date.now()))
+            timer.unref?.()
+          }),
+        ])
+      } catch (error) {
+        cancel()
+        throw classifyStreamFailure(error, signal)
+      } finally {
+        clearTimeout(timer)
+      }
+      if (row.done) break
+      deadline = Date.now() + timeoutMs
+      buffer += decoder.decode(row.value, { stream: true })
+      let index
+      while ((index = buffer.indexOf('\n')) !== -1) {
+        let line = buffer.slice(0, index)
+        buffer = buffer.slice(index + 1)
+        if (line.endsWith('\r')) line = line.slice(0, -1)
+        if (line === '') { dispatch(); continue }
+        if (line.startsWith(':')) continue
+        if (line.startsWith('data:')) {
+          const value = line.slice(5)
+          data.push(value.startsWith(' ') ? value.slice(1) : value)
+        }
+      }
+    }
+    // A final event may lack its terminating blank line.
+    buffer += decoder.decode()
+    const tail = buffer.replace(/\r$/, '')
+    if (tail.startsWith('data:')) {
+      const value = tail.slice(5)
+      data.push(value.startsWith(' ') ? value.slice(1) : value)
+    }
+    dispatch()
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener?.('abort', onAbort)
+  }
+}
+
+/**
  * Read the rest of a body that is not a stream, as text. Continues on the
  * decoder the head used, so a character split across the sniff boundary still
  * decodes.

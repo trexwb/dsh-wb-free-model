@@ -157,7 +157,7 @@ export class WbFreeModelAdapter {
       await this.service.ensureCatalog()
       models = this.service.listModels()
     } catch (error) {
-      // An unreachable runtime must not hide `auto`; the first call retries.
+      // An unreachable gateway must not hide `auto`; the first call retries.
       this.logger?.warn?.(`dsh-wb-free-model: model listing degraded (${error?.message ?? error})`)
     }
     return [
