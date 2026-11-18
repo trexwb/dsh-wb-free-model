@@ -214,18 +214,19 @@ window.__ModuleLoader__.load({
       const models = data?.models ?? []
       const failed = models.filter(model => model.result?.source === 'probe' && model.result?.ok === false)
       const refreshing = data?.refreshing === true
+      const quotaActive = Number(data?.laneQuotaUntil ?? 0) > Date.now()
       const runtimeLine = (() => {
         if (data === undefined) return '正在读取插件状态…'
-        if (!laneEnabled) return '车道已停用 · 运行时已停止，模型已从选择器移除'
-        if (data.runtime?.ready === true) return `运行时 ${data.runtime.version || ''} 已就绪 · 端口 ${data.runtime.port}`
-        if (data.runtime?.starting === true) return '运行时正在启动（首次启动会下载 OpenCode）…'
-        return data.lastError || '运行时未启动'
+        if (!laneEnabled) return '车道已停用，模型已从选择器移除'
+        if (quotaActive) return `免费车道配额窗口中（至 ${new Date(data.laneQuotaUntil).toLocaleTimeString()}）· Kilo 车道不受影响`
+        if (data.runtime?.ready === true) return '直连上游网关就绪 · 无需下载运行时'
+        return data.lastError || '尚未拉到模型清单，点「刷新目录」开始'
       })()
 
       return h('div', { style: { color: COLORS.text, fontSize: 13, lineHeight: 1.5, maxWidth: 860 } },
         h('h3', { style: { margin: '0 0 4px' } }, 'WB Free Model'),
         h('div', { style: { color: COLORS.muted, marginBottom: 10 } },
-          '免费模型由本机隔离的 OpenCode 运行时提供，不需要登录、注册或填写任何 API Key。选「WB · auto」会按耗时权重自动挑一个当前可用的模型。'),
+          '免费模型由插件进程直连上游免费网关（OpenCode 的免密免费车道与 Kilo 公共池），不需要登录、注册或填写任何 API Key，也不下载任何运行时。选「WB · auto」会按耗时权重自动挑一个当前可用的模型。'),
         data !== undefined && !laneEnabled
           ? h('div', {
               style: {
@@ -234,12 +235,30 @@ window.__ModuleLoader__.load({
                 fontSize: 12, color: COLORS.muted,
               },
             },
-            'WB Free Model 已停用：全部模型（含 WB · auto）已从模型选择器移除，运行时子进程已停止，探测与目录刷新已暂停，重启后也不会自动拉起。勾选下方「启用 WB Free Model 车道」即可重新开启。')
+            'WB Free Model 已停用：全部模型（含 WB · auto）已从模型选择器移除，探测与目录刷新已暂停，重启后也不会自动拉起。勾选下方「启用 WB Free Model 车道」即可重新开启。')
+          : null,
+        data !== undefined && laneEnabled && quotaActive
+          ? h('div', {
+              style: {
+                padding: '8px 10px', marginBottom: 10, borderRadius: 6,
+                border: `1px solid ${COLORS.warn}`, fontSize: 12, color: COLORS.warn,
+              },
+            },
+            `免费车道（OC · 前缀）触发了上游的出口配额：${data.laneQuotaMessage || '上游按出口 IP 计免费配额'}。窗口结束前免费车道的请求会在本地直接拒绝，不会去撞墙；Kilo 车道（KL · 前缀）不受影响。切换网络出口后可用「刷新目录」重新探测。`)
+          : null,
+        data !== undefined && laneEnabled && data.laneLocked
+          ? h('div', {
+              style: {
+                padding: '8px 10px', marginBottom: 10, borderRadius: 6,
+                border: `1px solid ${COLORS.bad}`, fontSize: 12, color: COLORS.bad,
+              },
+            },
+            `上游网关拒绝了本插件的客户端指纹：${data.laneLocked}。等待或重试无法解除，通常需要等待上游放开，或反馈到插件仓库。`)
           : null,
         h('div', { style: { fontSize: 12, color: error !== '' ? COLORS.bad : COLORS.muted, marginBottom: 10 } },
           error !== '' ? `状态读取失败：${error}（下面仍显示最后一次成功的数据）` : runtimeLine),
-        laneEnabled && data?.lastError && data?.runtime?.ready === true
-          ? h('div', { style: { fontSize: 12, color: COLORS.warn, marginBottom: 10 } }, `最近一次目录/运行时错误：${data.lastError}`)
+        laneEnabled && data?.lastError
+          ? h('div', { style: { fontSize: 12, color: COLORS.warn, marginBottom: 10 } }, `最近一次清单/上游错误：${data.lastError}`)
           : null,
         h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 } },
           h(Button, {
@@ -289,7 +308,7 @@ window.__ModuleLoader__.load({
           `目录更新于 ${new Date(data.catalogAt).toLocaleString()} · 共 ${models.length} 个免费模型`) : null,
         status === 'loading' ? h('div', { style: { color: COLORS.muted } }, '加载中…') : null,
         models.length === 0 && status === 'ready' && laneEnabled
-          ? h('div', { style: { color: COLORS.warn, marginTop: 8 } }, '还没有发现免费模型。点「刷新目录」重试；若运行时未就绪，先看上面的状态说明。')
+          ? h('div', { style: { color: COLORS.warn, marginTop: 8 } }, '还没有发现免费模型。点「刷新目录」重试；若持续失败，看上面的状态说明。')
           : null,
         models.length > 0 && data?.auto !== undefined
           ? h('div', { style: { marginTop: 8, padding: '7px 0', borderTop: `1px solid ${COLORS.border}` } },
@@ -310,7 +329,7 @@ window.__ModuleLoader__.load({
           onProbe: id => run(`probe:${id}`, () => post('/probe', { id }), '已开始重试，几秒后刷新状态'),
         })),
         models.length > 0 ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginTop: 12 } },
-          '工具调用的执行始终发生在 DSH 这一侧；托管模型只返回 JSON 动作请求，不会在 OpenCode 里执行本地命令。') : null,
+          '工具调用的执行始终发生在 DSH 这一侧；上游网关只生成文本与动作请求，不会执行任何本地操作。') : null,
       )
     }
 

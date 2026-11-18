@@ -1,14 +1,32 @@
 /**
- * Model lane: discovery, WB · auto selection, bridge completion, probe queue.
- * This is the DSH-side equivalent of wbBridge's orchestration + backend.
+ * Model lane: discovery, WB · auto selection, completion, probe queue.
+ *
+ * Both keyless lanes are reached directly over HTTPS from this process —
+ * there is no runtime binary, child process or local port anywhere. That is
+ * what lets the lane work on hosts that cannot spawn programs (iOS among
+ * them), and it is the architecture dsh-our-free-model proved on this lane.
+ *
+ * Tool execution still happens exclusively on the DSH side: the upstream
+ * gateways are pure inference endpoints, and the only tool calls in play are
+ * the ones their models emit as JSON, which the adapter hands to the harness.
  */
 
 import { selectModel, allWeightsExhausted, nextWeight, weightOf, autoLevels } from './auto.js'
-import { discoverModels } from './catalog.js'
-import { REQUEST_TIMEOUT_MS } from './constants.js'
-import { decodeEnvelope, prepareBridge, REPAIR_PROMPT, TRUNCATED_PROMPT } from './protocol.js'
+import { buildCatalog, buildKiloCatalog, parseListing } from './catalog.js'
+import {
+  DEFAULT_MAX_TOKENS,
+  FALLBACK_MAX_TOKENS,
+  LANE_QUOTA_DEFAULT_MS,
+  LISTING_TIMEOUT_MS,
+  REQUEST_TIMEOUT_MS,
+  UPSTREAM_LISTING_PATH,
+} from './constants.js'
+import { CODE, getJson, postStreamed, UpstreamError } from './http.js'
+import { fetchKiloListing, postKiloStreamed } from './kilo.js'
 import { probeModel, PROBE_TOOLS, probeMessages } from './probe.js'
-import { acceptsEffort, reasoningInfo, variantFor } from './reasoning.js'
+import { acceptsEffort, effortPatchFor, reasoningInfo } from './reasoning.js'
+import { applyFingerprint, endpointFor, sessionForConversation } from './upstream.js'
+import { feedChat, finishReason as finishReasonOf, repairToolPairing, StreamFold, toChatMessages, toToolDefs } from './wire.js'
 
 export class ModelError extends Error {
   constructor(message, { code = 'SERVER', status = 502, cause } = {}) {
@@ -28,47 +46,8 @@ export class ModelError extends Error {
   }
 }
 
-function sleep(ms) {
-  return new Promise(resolve => { const timer = setTimeout(resolve, ms); timer.unref?.() })
-}
-
-function usageFrom(tokens) {
-  if (tokens === null || typeof tokens !== 'object') return undefined
-  const input = Number.isFinite(tokens.input) ? tokens.input : 0
-  const output = Number.isFinite(tokens.output) ? tokens.output : 0
-  const usage = {
-    inputTokens: input,
-    outputTokens: output,
-  }
-  if (Number.isFinite(tokens.reasoning) && tokens.reasoning > 0) usage.reasoningTokens = tokens.reasoning
-  const read = tokens.cache?.read
-  const write = tokens.cache?.write
-  if (Number.isFinite(read) && read > 0) usage.cacheReadTokens = read
-  if (Number.isFinite(write) && write > 0) usage.cacheWriteTokens = write
-  return usage
-}
-
-function envelopeFrom(response, chatOnly) {
-  const info = response?.info
-  const parts = Array.isArray(response?.parts) ? response.parts : []
-  const structuredPart = parts.find(part => part?.type === 'tool'
-    && part?.tool === 'StructuredOutput'
-    && part?.state?.status === 'completed'
-    && part?.state?.input !== undefined
-    && part?.state?.input !== null)
-  const envelope = info?.structured !== undefined && info?.structured !== null
-    ? info.structured
-    : structuredPart?.state?.input
-  if (envelope !== undefined && envelope !== null) return JSON.stringify(envelope)
-  return parts
-    .filter(part => part?.type === 'text')
-    .map(part => part.text ?? '')
-    .join('')
-}
-
 export class ModelService {
-  constructor({ runtime, store, config, logger, resolveImage }) {
-    this.runtime = runtime
+  constructor({ store, config, logger, resolveImage }) {
     this.store = store
     this.config = config ?? {}
     this.logger = logger
@@ -82,6 +61,12 @@ export class ModelService {
     this.singleProbes = 0
     this.disposed = false
     this.lastError = ''
+    // The free lane's quota is accounted per egress IP; a burned exit answers
+    // every request with 429 and a Retry-After of hours. The breaker records
+    // that window once, from real traffic, and refuses locally until it ends.
+    this.quotaUntil = 0
+    this.quotaMessage = ''
+    this.laneLockedMessage = ''
   }
 
   get enabled() {
@@ -99,7 +84,7 @@ export class ModelService {
   /** Discovery is cached; refresh when empty, stale, or forced. */
   async ensureCatalog({ force = false } = {}) {
     if (!this.enabled) {
-      // A disabled lane never starts the runtime — not even for a stale or
+      // A disabled lane never talks to the upstreams — not even for a stale or
       // empty catalog. Callers serve whatever cache exists.
       return this.store.get().catalog
     }
@@ -114,33 +99,52 @@ export class ModelService {
       throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     }
     // Every caller wants fresh data; an in-flight refresh serves them all
-    // instead of pulling /provider twice during startup.
+    // instead of pulling both listings twice during startup.
     if (this.refreshing !== undefined) return this.refreshing
     const task = (async () => {
       try {
-        const backend = await this.runtime.ensure({ shouldRetry: () => this.enabled && !this.disposed })
-        // Each await can span a lane switch: a refresh must never write state
-        // (or leave a runtime it booted) for a lane that is now disabled.
-        if (!this.enabled || this.disposed) {
-          throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
+        const errors = []
+        const catalog = []
+        // Free lane: the listing names ids only; the capability table fills
+        // in the rest. One failed lane must not hide the other lane's models.
+        try {
+          const listing = await getJson(UPSTREAM_LISTING_PATH, {
+            session: sessionForConversation('catalog:wb-free-model'),
+          })
+          const free = buildCatalog(parseListing(listing))
+          if (free.length > 0) catalog.push(...free)
+          else errors.push('免费车道清单没有可用模型')
+        } catch (error) {
+          errors.push(`免费车道清单失败：${error?.message ?? error}`)
         }
-        const providers = await backend.providers()
-        if (!this.enabled || this.disposed) {
-          throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
+        try {
+          const payload = await fetchKiloListing({ timeoutMs: LISTING_TIMEOUT_MS })
+          const rows = Array.isArray(payload?.data) ? payload.data : []
+          catalog.push(...buildKiloCatalog(rows))
+        } catch (error) {
+          errors.push(`Kilo 清单失败：${error?.message ?? error}`)
         }
-        const catalog = discoverModels(providers)
-        if (catalog.length === 0) {
-          throw new ModelError('OpenCode returned no keyless free models', { code: 'EMPTY_RESPONSE' })
+        const seen = new Set()
+        const merged = []
+        for (const entry of catalog) {
+          if (seen.has(entry.id)) continue
+          seen.add(entry.id)
+          merged.push(entry)
         }
-        this.store.setCatalog(catalog)
+        if (merged.length === 0) {
+          throw new ModelError(`上游清单不可用（${errors.join('；')}）`, { code: 'EMPTY_RESPONSE' })
+        }
+        if (errors.length > 0) {
+          this.logger?.warn?.(`dsh-wb-free-model: partial listing refresh (${errors.join('; ')})`)
+        }
+        this.store.setCatalog(merged)
         await this.store.flush()
         this.lastError = ''
-        this.logger?.info?.(`dsh-wb-free-model: discovered ${catalog.length} free models`)
-        return catalog
+        this.logger?.info?.(`dsh-wb-free-model: discovered ${merged.length} free models`)
+        return merged
       } catch (error) {
-        // Surface catalog-level failures on the settings page (runtime.error
-        // alone never covers "runtime ready but /provider failing"). A disable
-        // is not a failure worth reporting.
+        // Surface catalog-level failures on the settings page. A disable is
+        // not a failure worth reporting.
         if (error?.code !== 'CONFIG_DISABLED') this.lastError = error?.message ?? String(error)
         throw error
       }
@@ -149,14 +153,13 @@ export class ModelService {
     return this.refreshing
   }
 
-  /** Stop-the-lane side effects: abort probes, then release the runtime child. */
+  /** Stop-the-lane side effects: abort probes. There is no child to reap. */
   async deactivate() {
     for (const controller of this.probeControllers) {
       try { controller.abort(new Error('WB Free Model 已关闭')) } catch { /* ignore */ }
     }
     this.probeControllers.clear()
-    await this.runtime.stop()
-    this.logger?.info?.('dsh-wb-free-model: lane deactivated; runtime stopped')
+    this.logger?.info?.('dsh-wb-free-model: lane deactivated; probes aborted')
   }
 
   isProbingModel(modelId) {
@@ -201,7 +204,7 @@ export class ModelService {
         name: 'WB · auto',
         description: '按耗时权重自动挑选当前可用的免费模型',
         context: { contextWindow: 131_072 },
-        defaultMaxTokens: 8_192,
+        defaultMaxTokens: FALLBACK_MAX_TOKENS,
         ...(autoLevels(catalog).length === 0 ? {} : {
           reasoning: { efforts: autoLevels(catalog).map(id => ({ id, name: id })) },
         }),
@@ -214,7 +217,7 @@ export class ModelService {
         id: modelId,
         name: modelId,
         context: { contextWindow: 131_072 },
-        defaultMaxTokens: 8_192,
+        defaultMaxTokens: FALLBACK_MAX_TOKENS,
       }
     }
     const info = reasoningInfo(entry)
@@ -225,7 +228,7 @@ export class ModelService {
       description: this.describe(entry),
       inputModalities: entry.images === true ? ['text', 'image'] : ['text'],
       context: { contextWindow: entry.context && entry.context > 0 ? entry.context : 131_072 },
-      defaultMaxTokens: entry.output && entry.output > 0 ? Math.min(entry.output, 32_768) : 8_192,
+      defaultMaxTokens: entry.output && entry.output > 0 ? Math.min(entry.output, DEFAULT_MAX_TOKENS) : FALLBACK_MAX_TOKENS,
       ...(info === undefined ? {} : { reasoning: info }),
     }
   }
@@ -246,10 +249,10 @@ export class ModelService {
   }
 
   /**
-   * One bridge completion. Adapter and probe share this path.
-   * Returns `{content, calls, chatOnly, usage, finish, modelId}`.
+   * One completion. Adapter and probe share this path.
+   * Returns `{content, calls, chatOnly, usage, finish, modelId, elapsed}`.
    */
-  async complete({ modelId, messages, system, tools, effort, signal, timeoutMs = REQUEST_TIMEOUT_MS }) {
+  async complete({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs = REQUEST_TIMEOUT_MS }) {
     if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
     try {
@@ -261,8 +264,8 @@ export class ModelService {
       this.logger?.warn?.(`dsh-wb-free-model: catalog refresh failed, serving the cached catalog (${error?.message ?? error})`)
     }
     // A disable that raced the refresh above must not slip through the swallowed
-    // failure and revive the runtime via ensure() below. Re-check everything
-    // that may have changed while we awaited.
+    // failure and revive a request here. Re-check everything that may have
+    // changed while we awaited.
     if (this.disposed) throw new ModelError('WB Free Model 插件已卸载', { code: 'CONFIG_DISABLED', status: 409 })
     if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
@@ -271,8 +274,8 @@ export class ModelService {
     const entry = this.resolveEntry(targetId)
     if (entry === undefined) throw new ModelError(`WB Free Model 不服务 "${targetId}"`, { code: 'MODEL_NOT_FOUND', status: 404 })
 
-    const result = this.store.get().results[entry.id]
-    const chatOnlyModel = result?.chatOnly === true
+    const state = this.store.get()
+    const chatOnlyModel = state.results[entry.id]?.chatOnly === true
     const wantsTools = (tools ?? []).length > 0
     if (effort !== undefined && !acceptsEffort(entry, effort)) {
       throw new ModelError(`模型 ${entry.name} 不支持推理档位 ${effort}`, { code: 'INVALID_REQUEST', status: 400 })
@@ -284,167 +287,153 @@ export class ModelService {
     if (hasImages && entry.images !== true) {
       throw new ModelError(`模型 ${entry.name} 不支持图片输入`, { code: 'INVALID_REQUEST', status: 400 })
     }
+    if (entry.lane !== 'kilo' && Date.now() < this.quotaUntil) {
+      const minutes = Math.max(1, Math.round((this.quotaUntil - Date.now()) / 60_000))
+      throw new ModelError(
+        `免费车道配额窗口中（约 ${minutes} 分钟后重试）：${this.quotaMessage || '上游按出口 IP 计免费配额，当前出口的窗口尚未结束'}`,
+        { code: 'RATE_LIMIT', status: 429 },
+      )
+    }
 
-    const prepared = prepareBridge({ messages, tools, imagesAllowed: entry.images === true, resolveImage: this.resolveImage })
-    const chatOnly = prepared.chatOnly
-    // The retry predicate is evaluated at retry time: a lane disabled while a
-    // cancelled boot was pending must never respawn the runtime here.
-    const backend = await this.runtime.ensure({
-      shouldRetry: () => this.enabled && !this.disposed && signal?.aborted !== true,
-    })
+    // ── project the harness conversation onto the Chat wire ────────────────────
+    const warnings = []
+    const chat = toChatMessages(repairToolPairing(messages), this.resolveImage, warnings)
+    if (warnings.includes('image-dropped')) {
+      this.logger?.warn?.('dsh-wb-free-model: one or more image attachments were dropped (unreadable as inline base64)')
+    }
+    const toolDefs = chatOnlyModel ? [] : toToolDefs(tools)
+    const payload = {
+      model: entry.lane === 'kilo' ? entry.id.slice('kilo/'.length) : entry.id,
+      messages: typeof system === 'string' && system !== ''
+        ? [{ role: 'system', content: system }, ...chat]
+        : chat,
+      stream: true,
+      max_tokens: Math.max(1, Math.trunc(Math.min(entry.output > 0 ? entry.output : DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS))),
+    }
+    if (toolDefs.length > 0) payload.tools = toolDefs
+    if (effort !== undefined) {
+      const patch = effortPatchFor(entry, effort)
+      if (patch !== null) Object.assign(payload, patch)
+    }
+
+    // The free lane's requests carry the v2 fingerprint shaping (official
+    // prompt, official tool set, reversible renames, usage/completion
+    // defaults) on every non-title body, tools or not; the Kilo lane has no
+    // gate and sees the caller's tools exactly as declared.
+    const renameMap = entry.lane === 'kilo' ? undefined : applyFingerprint(payload, false)
+    const fold = new StreamFold(() => {}, renameMap)
+    const onData = raw => {
+      let frame
+      try { frame = JSON.parse(raw) } catch { return }
+      try { feedChat(fold, frame) } catch { /* one malformed frame must not kill the turn */ }
+    }
+
     const started = Date.now()
-    const sessionId = await backend.createSession()
-    const permissionState = { native: false }
-    const watcher = this.watchPermissions(backend, sessionId, { chatOnly, state: permissionState })
-
-    const systemText = originalSystem(prepared, system)
-    const body = {
-      model: { providerID: entry.namespace, modelID: entry.key },
-      agent: chatOnly ? 'buddy-chat' : 'buddy-bridge',
-      system: chatOnly
-        ? systemText
-        : `${systemText}\nUse StructuredOutput to return this envelope. All other native tools are forbidden; do not perform the external actions yourself.`,
-      parts: [{ type: 'text', text: prepared.text }, ...prepared.images],
-    }
-    const variant = variantFor(entry, effort)
-    if (variant !== undefined) body.variant = variant
-    if (!chatOnly) {
-      body.format = { type: 'json_schema', retryCount: 0, schema: prepared.envelope }
-    }
-
-    const onAbort = () => { void backend.abortSession(sessionId).catch(() => {}) }
-    signal?.addEventListener('abort', onAbort, { once: true })
-
     try {
-      let response
-      try {
-        response = await backend.prompt(sessionId, body, { signal, timeoutMs })
-      } catch (error) {
-        if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
-        if (error?.code === 'TIMEOUT') throw new ModelError('免费模型请求超时', { code: 'TIMEOUT' })
-        if (permissionState.native) {
-          throw new ModelError('Chat-only model attempted native tool use; execution blocked', { code: 'INVALID_REQUEST' })
-        }
-        throw new ModelError(error?.message ?? 'OpenCode 请求失败', { code: error?.code ?? 'SERVER', status: error?.status })
-      }
-      if (permissionState.native) {
-        throw new ModelError('模型尝试调用 OpenCode 原生工具；请求已拒绝', { code: 'INVALID_REQUEST' })
-      }
-
-      const info = response?.info
-      const parts = Array.isArray(response?.parts) ? response.parts : []
-      const unexpected = parts.some(part => part?.type === 'tool'
-        && !['StructuredOutput', 'invalid'].includes(part?.tool)
-        && !(part?.state?.status === 'error' && permissionState.rejected?.has(part?.callID) === true))
-      if (unexpected) throw new ModelError('Unexpected native tool activity; response rejected', { code: 'INVALID_REQUEST' })
-      if (info?.error !== undefined && info?.error !== null) {
-        const message = info.error?.data?.message || info.error?.message || info.error?.name || 'Model request failed'
-        if (!(info.error?.name === 'StructuredOutputError') || chatOnly) {
-          throw new ModelError(String(message), { code: 'SERVER', status: info.error?.data?.statusCode ?? 502 })
-        }
-      }
-      const truncated = info?.finish === 'length'
-      const text = envelopeFrom(response, chatOnly)
-      let reply
-      if (chatOnly) {
-        if (String(text).trim() === '') throw new ModelError('Model returned no text', { code: 'EMPTY_RESPONSE' })
-        reply = { content: String(text), calls: [] }
+      if (entry.lane === 'kilo') {
+        await postKiloStreamed({ body: payload, signal, onData, timeoutMs })
       } else {
-        try {
-          if (truncated) throw new ModelError('Model output was truncated', { code: 'MAX_TOKENS' })
-          reply = this.decode(text, prepared.tools)
-        } catch (error) {
-          if (!['invalid_model_output', 'invalid_tool_call', 'MAX_TOKENS'].includes(error?.code)) throw error
-          reply = await this.repair({
-            backend, sessionId, body, prepared, signal, timeoutMs, error,
-          })
-        }
-      }
-
-      const usage = usageFrom(info?.tokens)
-      const elapsed = Date.now() - started
-      this.recordOutcome(entry.id, { ok: true, ms: elapsed, source: 'request' })
-      const finish = reply.calls.length > 0 ? 'tool-calls' : (info?.finish === 'length' ? 'max-tokens' : 'stop')
-      return { content: reply.content, calls: reply.calls, chatOnly, usage, finish, modelId: entry.id, elapsed }
-    } catch (error) {
-      // A real request failure is evidence about the model: record it so the
-      // weights, auto selection and the settings page can react. User
-      // cancellation is not the model's fault, and neither is a lane switched
-      // off (or teardown) mid-request killing the runtime under us.
-      if (error?.code !== 'ABORTED' && signal?.aborted !== true && this.enabled && !this.disposed) {
-        this.recordOutcome(entry.id, {
-          ok: false,
-          ms: Date.now() - started,
-          source: 'request',
-          code: error?.code ?? 'SERVER',
-          message: error?.message ?? String(error),
+        await postStreamed({
+          path: endpointFor(entry.id),
+          body: payload,
+          session: sessionForConversation(sessionId),
+          signal,
+          onData,
+          timeoutMs,
         })
       }
-      throw error
-    } finally {
-      signal?.removeEventListener('abort', onAbort)
-      watcher.stop()
-      void backend.deleteSession(sessionId).catch(() => {})
-    }
-  }
-
-  decode(text, tools) {
-    try {
-      return decodeEnvelope(text, { tools, parallel: true })
     } catch (error) {
-      throw new ModelError(error.message, { code: error.code, status: error.status })
-    }
-  }
-
-  async repair({ backend, sessionId, body, prepared, signal, timeoutMs, error }) {
-    const repairBody = {
-      ...body,
-      parts: [{
-        type: 'text',
-        text: error?.code === 'MAX_TOKENS' ? TRUNCATED_PROMPT : REPAIR_PROMPT,
-      }],
-    }
-    let response
-    try {
-      response = await backend.prompt(sessionId, repairBody, { signal, timeoutMs })
-    } catch (cause) {
-      throw new ModelError(cause?.message ?? '修复请求失败', { code: cause?.code ?? 'SERVER', status: cause?.status })
-    }
-    if (response?.info?.finish === 'length') {
-      throw new ModelError('Model output was truncated', { code: 'MAX_TOKENS', status: 502 })
-    }
-    return this.decode(envelopeFrom(response, false), prepared.tools)
-  }
-
-  /** Poll `/permission` while one prompt is in flight; reject every native request. */
-  watchPermissions(backend, sessionId, { chatOnly, state }) {
-    state.rejected = new Set()
-    const controller = new AbortController()
-    const loop = (async () => {
-      while (!controller.signal.aborted) {
-        try {
-          const pending = await backend.permissions()
-          for (const permission of Array.isArray(pending) ? pending : []) {
-            if (permission?.sessionID !== undefined && permission.sessionID !== sessionId) continue
-            if (chatOnly) state.native = true
-            // Record the callID on sight, not on reply success: the reply may
-            // fail because the permission already settled (e.g. another reject
-            // settled the whole pending set). The call was still blocked, so
-            // complete() must not misjudge its error part as "unexpected".
-            if (permission?.callID !== undefined) state.rejected.add(permission.callID)
-            try {
-              await backend.replyPermission(permission, 'reject', 'WB Free Model blocks native tool execution; return the action as an external tool call.')
-            } catch { /* the request may have settled already */ }
-          }
-        } catch { /* permission polling is best-effort */ }
-        await sleep(250)
+      if (error instanceof UpstreamError) {
+        if (entry.lane !== 'kilo') this.noteFreeLaneOutcome(false, error)
+        const aborted = error.code === CODE.aborted || signal?.aborted === true
+        if (!aborted && this.enabled && !this.disposed) {
+          this.recordOutcome(entry.id, {
+            ok: false,
+            ms: Date.now() - started,
+            source: 'request',
+            code: error.code,
+            message: error.message,
+          })
+        }
+        if (aborted) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
+        throw new ModelError(error.message, { code: error.code, status: error.status })
       }
-    })()
+      throw error
+    }
+    if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
+
+    fold.closeAll()
+    if (entry.lane !== 'kilo') this.noteFreeLaneOutcome(true, undefined)
+    // A stream that never reached a terminal frame was closed by something
+    // other than the model running out; a broken tool call (cut mid-JSON, or
+    // nameless) downgrades the whole turn to max-tokens so the harness prunes
+    // the unexecutable call instead of looping on it.
+    let finish = fold.finishToken === undefined
+      ? (fold.sawToolCall ? 'tool-calls' : 'stop')
+      : finishReasonOf(fold.finishToken)
+    if (fold.brokenToolCall) finish = 'max-tokens'
+
+    const content = fold.answerText
+    if (chatOnlyModel && String(content).trim() === '') {
+      throw new ModelError('Model returned no text', { code: 'EMPTY_RESPONSE' })
+    }
+
+    // Only a tool the caller actually declared may reach the harness: anything
+    // else is the fingerprint gate's decoy speaking, or the model inventing a
+    // tool — dropped with a warning either way.
+    const declared = new Set((tools ?? []).map(tool => tool?.name).filter(name => typeof name === 'string' && name !== ''))
+    const calls = []
+    for (const call of fold.calls) {
+      if (typeof call.name !== 'string' || call.name === '') continue
+      if (!declared.has(call.name)) {
+        this.logger?.warn?.(`dsh-wb-free-model: dropped a tool call to "${call.name}" — not one of the supplied tools`)
+        continue
+      }
+      let args
+      try { args = JSON.parse(call.arguments === '' ? '{}' : call.arguments) } catch { continue }
+      if (args === null || typeof args !== 'object' || Array.isArray(args)) continue
+      // The provider id rides along: replaying history sends the same id back
+      // to the upstream, which keeps its own tool-call accounting consistent.
+      calls.push({ id: typeof call.id === 'string' && call.id !== '' ? call.id : undefined, name: call.name, arguments: args })
+    }
+
+    const elapsed = Date.now() - started
+    this.recordOutcome(entry.id, { ok: true, ms: elapsed, source: 'request' })
     return {
-      stop: () => {
-        controller.abort()
-        void loop.catch(() => {})
-      },
+      content,
+      calls,
+      chatOnly: chatOnlyModel,
+      usage: fold.usage,
+      finish,
+      modelId: entry.id,
+      elapsed,
+    }
+  }
+
+  /**
+   * The free lane's breaker, learned passively from real traffic: a success
+   * says the lane is open, a 429 opens the retry window the upstream named
+   * (or the default one), and a client-gate refusal is recorded for the
+   * settings page — waiting cannot clear that one.
+   */
+  noteFreeLaneOutcome(ok, error) {
+    if (ok === true) {
+      this.quotaUntil = 0
+      this.quotaMessage = ''
+      this.laneLockedMessage = ''
+      return
+    }
+    if (error?.code === CODE.quota) {
+      const retryAfter = Number(error?.providerRetryAfterMs)
+      this.quotaUntil = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Date.now() + retryAfter
+        : Date.now() + LANE_QUOTA_DEFAULT_MS
+      this.quotaMessage = String(error?.message ?? 'free usage limit reached').slice(0, 300)
+      this.logger?.warn?.(`dsh-wb-free-model: free-lane quota window opens until ${new Date(this.quotaUntil).toISOString()}`)
+      return
+    }
+    if (error?.code === CODE.laneLocked) {
+      this.laneLockedMessage = String(error?.message ?? 'the free tier answers this client only').slice(0, 300)
     }
   }
 
@@ -575,14 +564,24 @@ export class ModelService {
 
   snapshot() {
     const state = this.store.get()
-    const runtime = this.runtime.status()
     const enabled = state.enabled !== false
     return {
       enabled,
       probeOnBoot: state.probeOnBoot !== false,
-      runtime,
+      runtime: {
+        // No child process exists anywhere: the lanes are reached directly.
+        mode: 'direct',
+        ready: enabled && state.catalog.length > 0,
+        starting: false,
+        version: 'direct',
+        port: 0,
+        error: this.lastError,
+      },
+      laneQuotaUntil: this.quotaUntil > Date.now() ? this.quotaUntil : 0,
+      laneQuotaMessage: this.quotaMessage,
+      laneLocked: this.laneLockedMessage,
       catalogAt: state.catalogAt,
-      lastError: this.lastError || runtime.error || '',
+      lastError: this.lastError,
       refreshing: this.refreshing !== undefined,
       probing: enabled && (this.probing || this.inflight > 0),
       probeProgress: this.probeRun === undefined ? undefined : { total: this.probeRun.total, done: this.probeRun.done() },
@@ -595,6 +594,7 @@ export class ModelService {
       models: enabled ? state.catalog.map(model => ({
         id: model.id,
         name: model.name,
+        lane: model.lane,
         context: model.context,
         output: model.output,
         images: model.images,
@@ -612,9 +612,4 @@ export class ModelService {
       } : undefined,
     }
   }
-}
-
-function originalSystem(prepared, system) {
-  const extra = typeof system === 'string' ? system.trim() : ''
-  return extra === '' ? prepared.system : `${extra}\n\n${prepared.system}`
 }

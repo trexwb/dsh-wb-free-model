@@ -7,7 +7,8 @@
  *
  * One route carries every free model, because the harness picker groups models
  * by provider id only. `WB · auto` is listed first; every other id is the real
- * `<namespace>/<model>` pair the bridge routes to OpenCode.
+ * model id the service routes to one of the two keyless upstream lanes (the
+ * free Zen gateway or Kilo's public pool).
  */
 
 import crypto from 'node:crypto'
@@ -212,6 +213,12 @@ export class WbFreeModelAdapter {
         system: options.system,
         tools: options.tools ?? [],
         effort: options.reasoningEffort,
+        // The upstream accounts the free lane's quota per session, so the same
+        // conversation must always map onto the same canonical upstream
+        // session — a fresh id per request burns the allowance into 429s.
+        sessionId: typeof options.sessionId === 'string' && options.sessionId.trim() !== ''
+          ? options.sessionId.trim()
+          : (typeof options.conversationId === 'string' && options.conversationId.trim() !== '' ? options.conversationId.trim() : undefined),
         signal: controller.signal,
       })
 
@@ -225,7 +232,8 @@ export class WbFreeModelAdapter {
       for (const call of result.calls) {
         // Random segment: two concurrent streams can emit their Nth call in the
         // same millisecond, and Date.now+index alone would collide on the id.
-        const id = `wb_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}_${index}`
+        const id = typeof call.id === 'string' && call.id !== '' ? call.id
+          : `wb_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}_${index}`
         const args = JSON.stringify(call.arguments)
         yield { type: 'block-start', index, blockType: 'tool-call' }
         yield { type: 'tool-call-delta', index, id, name: call.name, argumentsDelta: args }
