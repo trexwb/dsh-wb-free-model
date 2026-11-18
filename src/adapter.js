@@ -22,6 +22,54 @@ function toLlmError(error) {
   return new ModelError(message, { code: error?.code ?? 'SERVER', status: error?.status })
 }
 
+// ── request-image projection facts ────────────────────────────────────────
+//
+// dsh-llm resolves image pricing and the request target synchronously per
+// route and calls both unguarded on the adapter, so a structural adapter must
+// define them: with either missing, compaction over image-bearing history
+// dies inside "Cannot switch to …: context compaction failed" as
+// "…adapter.imageRequestPricing is not a function". The pricing must always
+// answer, too — returning `undefined` makes the meter fall back to the image
+// block's structural price only, badly undercounting real visual tokens (so
+// compaction under-triggers), and the spill policy throws "no image token
+// calculator" for image-bearing tool results. These local helpers replicate
+// the kernel's placeholder shapes without importing dsh-llm (which the
+// structural contract avoids).
+
+function digestOf(ref) {
+  return String(ref?.attachmentId ?? '').slice('sha256:'.length, 'sha256:'.length + 8)
+}
+
+function extensionOf(mediaType) {
+  switch (mediaType) {
+    case 'image/jpeg': return 'jpg'
+    case 'image/gif': return 'gif'
+    case 'image/webp': return 'webp'
+    default: return 'png'
+  }
+}
+
+/**
+ * Mid-market visual-token estimate for one request image. Free-pool upstreams
+ * publish no per-image pricing; the area anchor (w·h / 750) sits at or above
+ * most providers' charge for mid-size images — the safe direction for
+ * compaction planning — with a ceiling for pathological sizes.
+ */
+function estimateVisualTokens(ref) {
+  const width = Number(ref.width)
+  const height = Number(ref.height)
+  if (!(width > 0) || !(height > 0)) return 0
+  return Math.min(Math.ceil((width * height) / 750), 8192)
+}
+
+/** Same shape as the kernel's `offloadedImageText` without an access path. */
+function offloadedImagePlaceholder(ref) {
+  const identity = ref.name === undefined
+    ? String(ref.attachmentId)
+    : `${JSON.stringify(ref.name)} (${ref.attachmentId})`
+  return `[image omitted to fit request image limits; ${identity}. No local normalized image path is available; ask the user to attach it again if needed.]`
+}
+
 export class WbFreeModelAdapter {
   constructor({ service, logger }) {
     this.service = service
@@ -42,6 +90,59 @@ export class WbFreeModelAdapter {
       maxDelayMs: 8_000,
       jitterRatio: 0.2,
     })
+  }
+
+  // ── request-image surface ──────────────────────────────────────────────
+
+  /**
+   * Per-occurrence image pricing for the token meter, compaction estimators
+   * and spill policies; resolved synchronously per exact route. Pure: it reads
+   * only cached catalog state, never I/O. Returns one price per occurrence,
+   * aligned by index with `images`.
+   */
+  imageRequestPricing(provider, model) {
+    return {
+      priceImages: images => images.map((block, index) => this.priceImageOccurrence(model, block, index)),
+    }
+  }
+
+  /**
+   * The bridge inlines the normalized source without resizing (its send path
+   * only refuses bytes above the resolver ceiling), so the kernel's default
+   * "preserve the normalized source" target is exactly right.
+   */
+  imageRequestTarget(provider, model, image) {
+    return { width: image.width, height: image.height, maxBytes: image.bytes }
+  }
+
+  priceImageOccurrence(model, block, index) {
+    const ref = block?.attachment
+    if (ref === null || typeof ref !== 'object') return { visualTokens: 0, text: '' }
+    // An offloaded occurrence reaches the route as placeholder text only.
+    if (block.offloaded === true) {
+      return { visualTokens: 0, text: offloadedImagePlaceholder(ref) }
+    }
+    if (!this.acceptsImages(model)) {
+      // Same shape the kernel substitutes for text-only routes.
+      return { visualTokens: 0, text: `[image omitted because this model accepts text only; attachment sha256:${digestOf(ref)}]` }
+    }
+    // What the bridge sends at this position: the image as a file part plus a
+    // filename marker in the JSON conversation (the message number is not
+    // known at pricing time; its token weight is negligible). An image that
+    // fails to inline degrades to marker-only text at request time; pricing
+    // cannot read files, so it keeps the higher image estimate — the safe
+    // direction for compaction decisions.
+    return {
+      visualTokens: estimateVisualTokens(ref),
+      text: `[Attached image: message-1-image-${index + 1}.${extensionOf(ref.mediaType)}]`,
+    }
+  }
+
+  /** Whether the route can carry an image occurrence right now. */
+  acceptsImages(model) {
+    // `auto` re-routes image-bearing requests to an image-capable lane.
+    if (model === AUTO_MODEL_ID) return true
+    return this.service.resolveEntry(model)?.images === true
   }
 
   async listModels() {
