@@ -21,7 +21,7 @@ import fs from 'node:fs'
 import { ROUTE, ROUTE_LABEL, AUTO_MODEL_ID, AUTO_MODEL_NAME } from './src/constants.js'
 import { WbFreeModelAdapter } from './src/adapter.js'
 import { ModelService, ModelError } from './src/service.js'
-import { Store, resolveDataDir } from './src/store.js'
+import { Store, resolveDataDir, excludedIds } from './src/store.js'
 
 export const name = 'dsh-wb-free-model'
 export const inject = ['llm']
@@ -196,7 +196,10 @@ export function apply(ctx, config = {}) {
           // land in snapshot.lastError; clients poll /status.
           void service.refreshCatalog()
             .then(() => {
-              if (body.probe === true) return service.startProbes({ concurrency: body.concurrency })
+              // A refresh can swap models in: re-derive the arm point, then
+              // optionally run a manual probe batch over the fresh catalog.
+              service.ensureCheckTimer()
+              if (body.probe === true) return service.startProbes({ concurrency: body.concurrency, trigger: 'manual' })
             })
             .catch(() => {})
           return sendJSON(res, 202, { started: true, ...service.snapshot() })
@@ -204,6 +207,21 @@ export function apply(ctx, config = {}) {
         if (route === '/probe') {
           if (!service.enabled) return disabled()
           if (typeof body.id === 'string' && body.id !== '') {
+            // Recycled/disabled models refuse probes with a coded 409 (the
+            // settings page's inline retry never sends these; the guard keeps
+            // stale clients and races honest). The same check backs probeOne.
+            const excluded = excludedIds(store.get())
+            if (excluded.has(body.id)) {
+              const recycledModel = store.get().recycled.includes(body.id)
+              return sendJSON(res, 409, {
+                started: false,
+                reason: recycledModel ? 'recycled' : 'disabled',
+                id: body.id,
+                error: recycledModel ? '该模型已移入回收站，请先恢复再检测' : '该模型已被禁用，无法检测',
+                code: recycledModel ? 'RECYCLED' : 'DISABLED',
+                ...service.snapshot(),
+              })
+            }
             if (service.isProbingModel(body.id)) {
               return sendJSON(res, 409, { started: false, reason: 'in-flight', id: body.id, error: '该模型正在检测中', code: 'PROBE_IN_PROGRESS', ...service.snapshot() })
             }
@@ -230,14 +248,84 @@ export function apply(ctx, config = {}) {
         if (route === '/retry') {
           if (!service.enabled) return disabled()
           if (typeof body.id === 'string' && body.id !== '') {
+            if (store.get().recycled.includes(body.id)) {
+              return sendJSON(res, 409, {
+                started: false,
+                reason: 'recycled',
+                id: body.id,
+                error: '该模型已移入回收站，请先恢复再重试',
+                code: 'RECYCLED',
+                ...service.snapshot(),
+              })
+            }
             store.dropResult(body.id)
             store.update({ disabled: store.get().disabled.filter(id => id !== body.id) })
           } else {
+            // The full clear keeps the recycle bin: a recycled model must not
+            // silently re-enter the selector because probe results were reset.
             for (const model of store.get().catalog) store.dropResult(model.id)
             store.update({ disabled: [] })
           }
           await store.flush()
+          // Un-disabled models re-enter the selector only via a replace
+          // broadcast (see broadcast()); the same re-query republishes models
+          // whose results just dropped.
+          broadcast()
+          service.ensureCheckTimer()
           return sendJSON(res, 200, { ok: true, ...service.snapshot() })
+        }
+        if (route === '/recycle') {
+          // Deliberately NOT behind the !service.enabled gate: the recycle bin
+          // is viewable and operable while the lane is off (snapshot.recycled
+          // keeps returning catalog entries). Safety: ensureCheckTimer refuses
+          // to arm while disabled, so a restored model is only picked up once
+          // the lane starts again.
+          const id = typeof body.id === 'string' && body.id !== '' ? body.id : undefined
+          const model = id === undefined ? undefined : service.resolveEntry(id)
+          if (model === undefined) {
+            return sendJSON(res, 404, { error: `未知模型 "${id ?? ''}"`, code: 'MODEL_NOT_FOUND', ...service.snapshot() })
+          }
+          if (service.isProbingModel(id)) {
+            return sendJSON(res, 409, {
+              started: false,
+              reason: 'in-flight',
+              id,
+              error: '该模型正在检测中，请等当前检测完成',
+              code: 'PROBE_IN_PROGRESS',
+              ...service.snapshot(),
+            })
+          }
+          store.update({
+            recycled: [...store.get().recycled.filter(item => item !== id), id],
+            disabled: store.get().disabled.filter(item => item !== id),
+          })
+          // Keep the failure evidence: the record explains why the model is in
+          // the bin (and what restore will clear).
+          await store.flush()
+          // Selector removal is driven solely by replace broadcasts — without
+          // this the recycled model lingers there until the next lane toggle.
+          broadcast()
+          service.ensureCheckTimer()
+          return sendJSON(res, 200, { ok: true, id, ...service.snapshot() })
+        }
+        if (route === '/restore') {
+          const id = typeof body.id === 'string' && body.id !== '' ? body.id : undefined
+          const model = id === undefined ? undefined : service.resolveEntry(id)
+          if (model === undefined) {
+            return sendJSON(res, 404, { error: `未知模型 "${id ?? ''}"`, code: 'MODEL_NOT_FOUND', ...service.snapshot() })
+          }
+          store.update({
+            recycled: store.get().recycled.filter(item => item !== id),
+            disabled: store.get().disabled.filter(item => item !== id),
+          })
+          // Back to "never probed": the kept failure record would keep the
+          // restored model hidden from the selector (probe failures are not
+          // published) and its stale evidence would pollute the fresh start.
+          store.dropResult(id)
+          await store.flush()
+          broadcast()
+          service.ensureCheckTimer()
+          return sendJSON(res, 200, { ok: true, id, ...service.snapshot() })
         }
         if (route === '/settings') {
           const patch = {}
@@ -286,26 +374,45 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** The existing start path, shared by boot and re-enabling: refresh → probes → publish. */
+  /**
+   * The existing start path, shared by boot and re-enabling: refresh → arm →
+   * probes per probeOnBoot → publish.
+   */
   async function startLane() {
-    await service.refreshCatalog()
+    try {
+      await service.refreshCatalog()
+    } finally {
+      // Arming must not depend on the refresh succeeding: a failed start
+      // throws into boot/enableLane's catch (which swallows it), and without
+      // this the 24h maintenance would never arm for the session.
+      if (!disposed && service.enabled) service.ensureCheckTimer()
+    }
     if (disposed || !service.enabled) return
+    // probeOnBoot=false: no immediate probes at all — the armed cadence picks
+    // due models up within the spread window (≤15 minutes).
     if (store.get().probeOnBoot === false) {
-      logger.info?.('dsh-wb-free-model: boot probe disabled in settings')
+      logger.info?.('dsh-wb-free-model: boot probe disabled in settings; the 24h cadence takes over')
       return
     }
-    // Freshness counts probe outcomes only: a request success from a previous
-    // session must not mask models that were never (or adversely) probed.
+    // First boot for this state (no probe evidence anywhere): probe everything
+    // right now so the selector is populated immediately instead of trickling
+    // in over hours. Failures count as scheduled evidence, same as the
+    // cadence; the boot round advances checkedAt like any scheduled check.
     const probed = Object.values(store.get().results).filter(result => result?.source === 'probe')
-    const newest = probed.length === 0 ? 0 : Math.max(...probed.map(result => Number(result?.at ?? 0)))
-    const fresh = probed.length > 0 && Date.now() - newest < 12 * 60 * 60 * 1000
-    const anyPassed = probed.some(result => result?.ok === true)
-    if (fresh && anyPassed) return
-    // Probes are sequential, rate-limited completions; two workers keep the
-    // boot responsive without hammering either gateway.
-    void service.startProbes({ concurrency: config.probeConcurrency ?? 2 }).catch(error => {
-      logger.warn?.(`dsh-wb-free-model: boot probe failed: ${error?.message ?? error}`)
-    })
+    if (probed.length === 0) {
+      void service.startProbes({ concurrency: config.probeConcurrency ?? 2, trigger: 'scheduled' }).catch(error => {
+        logger.warn?.(`dsh-wb-free-model: boot probe failed: ${error?.message ?? error}`)
+      })
+      return
+    }
+    // Otherwise arm only: due models enter the trickle (2 per 15 minutes)
+    // instead of a full re-probe on every restart. Log the throttle decision —
+    // no probe fires on this path, so without a line here the behavior is
+    // only visible through the status API.
+    const dueCount = service.dueModels().length
+    const totalCount = store.get().catalog.length
+    const nextAt = typeof service.checkAt === 'number' ? new Date(service.checkAt).toISOString() : 'none'
+    logger.info?.(`dsh-wb-free-model: boot maintenance armed: ${totalCount - dueCount} fresh, ${dueCount} due; next check at ${nextAt}`)
   }
 
   // Toggle side effects run one at a time so rapid double-toggles can never
