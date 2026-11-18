@@ -1,7 +1,9 @@
 /** `WB · auto` weighted selection (ported from wbBridge `auto.rs`). */
 
-import { DEFAULT_EFFORTS, DEFAULT_WEIGHT, PROBE_WEIGHT_PENALTY, PROBE_WEIGHT_SLOW_MS } from './constants.js'
-import { acceptsEffort, reasoningEfforts } from './reasoning.js'
+import { DEFAULT_WEIGHT, PROBE_WEIGHT_PENALTY, PROBE_WEIGHT_SLOW_MS } from './constants.js'
+import { acceptsEffort } from './reasoning.js'
+
+export { autoLevels } from './reasoning.js'
 
 export function probeWeight(durationMs) {
   if (durationMs <= 2_000) return 100
@@ -75,9 +77,4 @@ export function selectModel({ models, results, images = false, tools = false, ef
   const max = Math.max(...domain.map(model => weightOf(model, results[model.id])))
   const top = domain.filter(model => weightOf(model, results[model.id]) === max)
   return top[Math.min(top.length - 1, Math.floor(random() * top.length))]?.id
-}
-
-/** DSH efforts supported by at least one free model (union for the auto entry). */
-export function autoLevels(models) {
-  return DEFAULT_EFFORTS.filter(level => models.some(model => reasoningEfforts(model).has(level)))
 }

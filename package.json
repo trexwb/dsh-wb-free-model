@@ -1,9 +1,9 @@
 {
   "name": "dsh-wb-free-model",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "WB Free Model — 在 DSH 里装上这个插件，无需登录、注册或填 API Key，即可使用 OpenCode 与 Kilo 的免费模型池；WB · auto 自动挑选当前可用的最快免费模型。",
+  "description": "WB Free Model — 在 DSH 里装上这个插件，无需登录、注册或填 API Key，即可使用两条免密免费车道（OpenCode 免密池与 Kilo 公共池）；插件进程内直连，无运行时无子进程，iOS 宿主同样可用；WB · auto 自动挑选当前可用的最快免费模型。",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/trexwb/dsh-wb-free-model.git"

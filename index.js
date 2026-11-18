@@ -1,14 +1,18 @@
 /**
  * WB Free Model — DSH plugin entry (Host half).
  *
- * One isolated OpenCode 1.19.6 runtime hosts this machine's keyless free
- * models. The plugin owns no user credential: it discovers what the runtime
- * offers, publishes only zero-cost models, probes them on boot (ported from
+ * Two keyless free-model lanes are reached directly over HTTPS from this
+ * process: the Zen gateway behind opencode.ai (the same pooled anonymous lane
+ * the OpenCode client speaks to) and Kilo AI's public gateway. There is no
+ * runtime binary, child process or local port anywhere, which is what makes
+ * the lane usable from hosts that cannot spawn programs — iOS among them.
+ * The plugin publishes only free models, probes them on boot (ported from
  * wbBridge), and serves one extra weighted virtual model, `WB · auto`.
  *
- * Bridge semantics are wbBridge's: the hosted model never executes DSH tools.
- * It returns a `{content, calls}` envelope; the adapter validates it and emits
- * ordinary DSH tool-call blocks for the harness to execute.
+ * Tool semantics stay wbBridge's where it matters: the upstream gateways are
+ * pure inference endpoints and never execute anything. The only tool calls in
+ * play are the ones their models emit as JSON; the adapter emits ordinary DSH
+ * tool-call blocks for the harness to execute, with its own permission system.
  *
  * @module index.js
  */
@@ -17,7 +21,6 @@ import fs from 'node:fs'
 import { ROUTE, ROUTE_LABEL, AUTO_MODEL_ID, AUTO_MODEL_NAME } from './src/constants.js'
 import { WbFreeModelAdapter } from './src/adapter.js'
 import { ModelService, ModelError } from './src/service.js'
-import { Runtime } from './src/runtime.js'
 import { Store, resolveDataDir } from './src/store.js'
 
 export const name = 'dsh-wb-free-model'
@@ -101,8 +104,7 @@ export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console
   const dataDir = resolveDataDir()
   const store = new Store({ dataDir, logger })
-  const runtime = new Runtime({ dataDir, config, logger })
-  const service = new ModelService({ runtime, store, config, logger, resolveImage: imageResolver(ctx, logger) })
+  const service = new ModelService({ store, config, logger, resolveImage: imageResolver(ctx, logger) })
   const adapter = new WbFreeModelAdapter({ service, logger })
   let disposed = false
 
@@ -188,10 +190,10 @@ export function apply(ctx, config = {}) {
         })
         if (route === '/refresh') {
           if (!service.enabled) return disabled()
-          // Fire-and-forget like /probe: a cold start can legitimately take
-          // minutes (runtime download), far beyond any client's patience, and
-          // the connection must not decide whether the refresh finishes.
-          // Failures land in snapshot.lastError; clients poll /status.
+          // Fire-and-forget like /probe: both upstream listings can be slow on
+          // a bad network day, far beyond a client's patience, and the
+          // connection must not decide whether the refresh finishes. Failures
+          // land in snapshot.lastError; clients poll /status.
           void service.refreshCatalog()
             .then(() => {
               if (body.probe === true) return service.startProbes({ concurrency: body.concurrency })
@@ -267,19 +269,15 @@ export function apply(ctx, config = {}) {
       disposed = true
       service.dispose()
       store.dispose()
-      await runtime.stop()
-      // The reversible stop keeps the process-exit hook armed for crashes;
-      // teardown is final, so release the hook (keeps reloads from stacking them).
-      runtime.dispose()
     }
   }, 'dsh-wb-free-model: lifecycle')
 
   async function boot() {
     try {
-      // A disabled lane stays fully down across restarts: no runtime child, no
-      // catalog refresh, no probes, until the user re-enables it.
+      // A disabled lane stays fully down across restarts: no upstream request,
+      // no catalog refresh, no probes, until the user re-enables it.
       if (!service.enabled) {
-        logger.info?.('dsh-wb-free-model: lane is disabled in settings; runtime stays down until re-enabled')
+        logger.info?.('dsh-wb-free-model: lane is disabled in settings; nothing talks to the upstreams until re-enabled')
         return
       }
       await startLane()
@@ -322,14 +320,13 @@ export function apply(ctx, config = {}) {
   async function disableLane() {
     broadcast()
     await service.deactivate()
-    logger.info?.('dsh-wb-free-model: lane disabled; models withdrawn and runtime stopped')
+    logger.info?.('dsh-wb-free-model: lane disabled; models withdrawn and probes stopped')
   }
 
   function enableLane() {
     broadcast()
-    // The start path runs in the background: a cold boot may download the
-    // runtime, and the settings response must not wait on it. /status reflects
-    // progress (runtime.starting, refreshing, models appearing).
+    // The start path runs in the background: the settings response must not
+    // wait on it. /status reflects progress (refreshing, models appearing).
     void startLane().catch(error => {
       logger.warn?.(`dsh-wb-free-model: lane start failed: ${error?.message ?? error}`)
     })
