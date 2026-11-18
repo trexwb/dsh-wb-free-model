@@ -10,6 +10,7 @@
  * `<namespace>/<model>` pair the bridge routes to OpenCode.
  */
 
+import crypto from 'node:crypto'
 import { AUTO_MODEL_ID, AUTO_MODEL_NAME, ROUTE, ROUTE_LABEL } from './constants.js'
 import { ModelError } from './service.js'
 
@@ -44,6 +45,11 @@ export class WbFreeModelAdapter {
   }
 
   async listModels() {
+    // The selector's catalog comes solely from this method, so a disabled lane
+    // withdraws every model — `WB · auto` included — without unregistering the
+    // adapter (that would break in-flight streams; the registration stays and
+    // a `replace` broadcast makes the harness re-query).
+    if (!this.service.enabled) return []
     let models = []
     try {
       await this.service.ensureCatalog()
@@ -116,7 +122,9 @@ export class WbFreeModelAdapter {
         index += 1
       }
       for (const call of result.calls) {
-        const id = `wb_${Date.now().toString(36)}_${index}`
+        // Random segment: two concurrent streams can emit their Nth call in the
+        // same millisecond, and Date.now+index alone would collide on the id.
+        const id = `wb_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}_${index}`
         const args = JSON.stringify(call.arguments)
         yield { type: 'block-start', index, blockType: 'tool-call' }
         yield { type: 'tool-call-delta', index, id, name: call.name, argumentsDelta: args }
@@ -129,7 +137,12 @@ export class WbFreeModelAdapter {
       }
       yield {
         type: 'finish',
-        reason: result.calls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' },
+        // A chat-only reply cut off by the output limit must not masquerade as
+        // a clean stop: `max-tokens` is a kernel finish kind (it makes the
+        // kernel drop non-executable tool-call blocks).
+        reason: result.calls.length > 0
+          ? { kind: 'tool-calls' }
+          : result.finish === 'max-tokens' ? { kind: 'max-tokens' } : { kind: 'stop' },
       }
     } catch (error) {
       const failure = toLlmError(error)

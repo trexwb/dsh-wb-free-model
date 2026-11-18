@@ -46,6 +46,34 @@ window.__ModuleLoader__.load({
       body: JSON.stringify(body ?? {}),
     })
 
+    const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+    /**
+     * Retry the failed models one POST at a time. The server caps single-model
+     * probes at `probeConcurrency`, so a burst larger than that must wait for a
+     * free slot instead of piling into 409s and aborting mid-list. A 409 that
+     * still slips through a race gets one delayed retry.
+     */
+    async function retryFailedModels(ids, { post, getStatus, limit = 2, waitMs = 500, maxWaits = 40 }) {
+      for (const id of ids) {
+        let waits = 0
+        for (;;) {
+          const status = await getStatus().catch(() => undefined)
+          const busy = Number(status?.probeSlotsBusy)
+          if (!Number.isFinite(busy) || busy < limit || waits >= maxWaits) break
+          await delay(waitMs)
+          waits += 1
+        }
+        try {
+          await post('/probe', { id })
+        } catch (error) {
+          if (error?.status !== 409) throw error
+          await delay(800)
+          await post('/probe', { id })
+        }
+      }
+    }
+
     const COLORS = {
       text: 'var(--vscode-foreground, #1f2328)',
       muted: 'var(--vscode-descriptionForeground, #656d76)',
@@ -157,26 +185,38 @@ window.__ModuleLoader__.load({
     function SettingsSection() {
       const { status, data, error, reload } = useStatus()
       const [busy, setBusy] = useState('')
-      const [note, setNote] = useState('')
+      const [note, setNote] = useState(null)
 
       const run = useCallback(async (key, action, done = '') => {
         setBusy(key)
-        setNote('')
+        setNote(null)
         try {
           await action()
-          setNote(done)
+          if (done !== '') setNote({ text: done, tone: 'ok' })
           await reload()
         } catch (cause) {
-          setNote(`失败：${cause?.message ?? cause}`)
+          const message = String(cause?.message ?? cause)
+          const interrupted = /abort|timeout|timed out|network/i.test(message)
+          setNote({
+            text: interrupted
+              ? `失败：请求超时或被中断（${message}）。后台任务不受影响，状态会自动刷新。`
+              : `失败：${message}`,
+            tone: 'bad',
+          })
+          // Even a failed action may have changed server state; refresh anyway.
+          await reload().catch(() => {})
         } finally {
           setBusy('')
         }
       }, [reload])
 
+      const laneEnabled = data?.enabled !== false
       const models = data?.models ?? []
       const failed = models.filter(model => model.result?.source === 'probe' && model.result?.ok === false)
+      const refreshing = data?.refreshing === true
       const runtimeLine = (() => {
         if (data === undefined) return '正在读取插件状态…'
+        if (!laneEnabled) return '车道已停用 · 运行时已停止，模型已从选择器移除'
         if (data.runtime?.ready === true) return `运行时 ${data.runtime.version || ''} 已就绪 · 端口 ${data.runtime.port}`
         if (data.runtime?.starting === true) return '运行时正在启动（首次启动会下载 OpenCode）…'
         return data.lastError || '运行时未启动'
@@ -186,32 +226,53 @@ window.__ModuleLoader__.load({
         h('h3', { style: { margin: '0 0 4px' } }, 'WB Free Model'),
         h('div', { style: { color: COLORS.muted, marginBottom: 10 } },
           '免费模型由本机隔离的 OpenCode 运行时提供，不需要登录、注册或填写任何 API Key。选「WB · auto」会按耗时权重自动挑一个当前可用的模型。'),
+        data !== undefined && !laneEnabled
+          ? h('div', {
+              style: {
+                padding: '8px 10px', marginBottom: 10, borderRadius: 6,
+                border: `1px solid ${COLORS.border}`, background: COLORS.panel,
+                fontSize: 12, color: COLORS.muted,
+              },
+            },
+            'WB Free Model 已停用：全部模型（含 WB · auto）已从模型选择器移除，运行时子进程已停止，探测与目录刷新已暂停，重启后也不会自动拉起。勾选下方「启用 WB Free Model 车道」即可重新开启。')
+          : null,
         h('div', { style: { fontSize: 12, color: error !== '' ? COLORS.bad : COLORS.muted, marginBottom: 10 } },
           error !== '' ? `状态读取失败：${error}（下面仍显示最后一次成功的数据）` : runtimeLine),
+        laneEnabled && data?.lastError && data?.runtime?.ready === true
+          ? h('div', { style: { fontSize: 12, color: COLORS.warn, marginBottom: 10 } }, `最近一次目录/运行时错误：${data.lastError}`)
+          : null,
         h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 } },
           h(Button, {
             primary: true,
-            disabled: busy !== '',
-            onClick: () => run('refresh', () => post('/refresh'), '目录已刷新'),
-          }, busy === 'refresh' ? '刷新中…' : '刷新目录'),
+            disabled: busy !== '' || refreshing || !laneEnabled,
+            onClick: () => run('refresh', () => post('/refresh'), '目录刷新已开始，状态会自动更新'),
+          }, refreshing || busy === 'refresh' ? '刷新中…' : '刷新目录'),
           h(Button, {
-            disabled: busy !== '' || data?.runtime?.ready !== true || data?.probing === true,
+            disabled: busy !== '' || !laneEnabled || data?.runtime?.ready !== true || data?.probing === true,
             onClick: () => run('probe', () => post('/probe'), '已开始检测，结果会逐个出现'),
           }, data?.probing === true && data?.probeProgress !== undefined ? '检测中…' : '检测全部'),
           h(Button, {
-            disabled: busy !== '' || failed.length === 0,
-            onClick: () => run('retry', async () => { await post('/retry'); return post('/probe') }, '已开始重新检测'),
+            disabled: busy !== '' || !laneEnabled || failed.length === 0,
+            onClick: () => run('retry', () => retryFailedModels(
+              failed.map(model => model.id),
+              { post, getStatus: () => api('/status'), limit: data?.probeConcurrency ?? 2 },
+            ), `已开始重试 ${failed.length} 个失败模型，结果会逐个出现`),
           }, `重试失败（${failed.length}）`),
           h(Button, { disabled: busy !== '', onClick: () => run('reload', reload) }, '重新读取'),
           data?.probing === true && data.probeProgress !== undefined
             ? h('span', { style: { fontSize: 12, color: COLORS.muted } }, `探测 ${data.probeProgress.done}/${data.probeProgress.total}`)
+            : null,
+          refreshing && data?.probing !== true
+            ? h('span', { style: { fontSize: 12, color: COLORS.muted } }, '目录刷新中…')
             : null),
-        note !== '' ? h('div', { style: { fontSize: 12, color: COLORS.warn, marginBottom: 6 } }, note) : null,
+        note !== null && note.text !== ''
+          ? h('div', { style: { fontSize: 12, color: note.tone === 'bad' ? COLORS.bad : COLORS.ok, marginBottom: 6 } }, note.text)
+          : null,
         h('div', { style: { display: 'flex', gap: 18, flexWrap: 'wrap', margin: '8px 0 12px', fontSize: 12 } },
           h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
             h('input', {
               type: 'checkbox',
-              checked: data?.enabled !== false,
+              checked: laneEnabled,
               disabled: busy !== '',
               onChange: event => run('enabled', () => post('/settings', { enabled: event.target.checked }), '设置已保存'),
             }),
@@ -224,10 +285,10 @@ window.__ModuleLoader__.load({
               onChange: event => run('boot', () => post('/settings', { probeOnBoot: event.target.checked }), '设置已保存'),
             }),
             '启动时自动检测模型')),
-        data?.catalogAt ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginBottom: 4 } },
+        data?.catalogAt && laneEnabled ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginBottom: 4 } },
           `目录更新于 ${new Date(data.catalogAt).toLocaleString()} · 共 ${models.length} 个免费模型`) : null,
         status === 'loading' ? h('div', { style: { color: COLORS.muted } }, '加载中…') : null,
-        models.length === 0 && status === 'ready'
+        models.length === 0 && status === 'ready' && laneEnabled
           ? h('div', { style: { color: COLORS.warn, marginTop: 8 } }, '还没有发现免费模型。点「刷新目录」重试；若运行时未就绪，先看上面的状态说明。')
           : null,
         models.length > 0 && data?.auto !== undefined
@@ -241,7 +302,11 @@ window.__ModuleLoader__.load({
         ...models.map(model => h(Row, {
           key: model.id,
           model,
-          busy: busy === `probe:${model.id}` || data?.probeProgress !== undefined,
+          // probingIds covers single-model probes, which never set probeProgress;
+          // it keeps the row busy so a retry cannot be double-clicked into a
+          // duplicate concurrent probe.
+          busy: busy === `probe:${model.id}` || data?.probeProgress !== undefined
+            || (Array.isArray(data?.probingIds) && data.probingIds.includes(model.id)),
           onProbe: id => run(`probe:${id}`, () => post('/probe', { id }), '已开始重试，几秒后刷新状态'),
         })),
         models.length > 0 ? h('div', { style: { fontSize: 11, color: COLORS.muted, marginTop: 12 } },
@@ -262,7 +327,7 @@ window.__ModuleLoader__.load({
     exports.apply = apply
     exports.inject = inject
     exports.name = 'dsh-wb-free-model'
-    exports.__test = { SettingsSection, availability, modelDetail, API }
+    exports.__test = { SettingsSection, availability, modelDetail, API, retryFailedModels }
     return module.exports
   },
 })

@@ -82,7 +82,11 @@ export function toolCallUnsupported(message) {
 }
 
 export function formatUnsupported(error) {
-  if (error?.code === 'invalid_model_output' || error?.code === 'invalid_tool_call') return true
+  // `invalid_tool_call` means the model DID produce a tool call (an unlisted
+  // name or malformed arguments) — it must fail the probe as a mismatch, not
+  // degrade to chat-only: only an unparseable envelope or an explicit gateway
+  // refusal is evidence of "cannot call functions".
+  if (error?.code === 'invalid_model_output') return true
   return toolCallUnsupported(error?.message)
 }
 
@@ -94,8 +98,10 @@ function chatOnlyConfirmed(error) {
  * Run one probe with a per-model 60s deadline. `run` performs one bridge
  * completion and returns `{content, calls}`; it must honor `signal`.
  *
- * Outcome matches wbBridge: a text-only reply is published as chat-only, a
- * format/function-call refusal degrades to chat-only, everything else fails.
+ * Outcome matches wbBridge: a text-only reply or an explicit gateway
+ * function-calling refusal degrades to chat-only; a malformed envelope degrades
+ * to chat-only; everything else — including well-formed-but-unlisted tool
+ * calls — fails the probe.
  */
 export async function probeModel({ run, outerSignal }) {
   const token = crypto.randomBytes(8).toString('hex')

@@ -113,14 +113,25 @@ export function apply(ctx, config = {}) {
   }
 
   const registration = ctx.llm.registerAdapter([ROUTE], adapter)
-  ctx.llm.registerConfigurableProviders?.([{
+  const directoryEntries = [{
     provider: ROUTE,
     displayName: ROUTE_LABEL,
     settingsNs: settingsNamespace(ctx),
     settingsPath: [],
-  }])
-  ctx.llm.registerModelDiscovery?.(settingsNamespace(ctx), async () => {
-    await service.refreshCatalog({ force: true })
+  }]
+  const directory = ctx.llm.registerConfigurableProviders?.(directoryEntries)
+  ctx.llm.registerModelDiscovery?.(settingsNamespace(ctx), async (request, signal) => {
+    // This hook is the settings page's "interrogate one endpoint" offer (dsh-llm
+    // calls `discover(request, signal)` with a draft endpoint description) — it
+    // is NOT the selector's publication channel; that is adapter.listModels().
+    if (signal?.aborted === true) return []
+    if (!service.enabled) return []
+    try {
+      await service.refreshCatalog()
+    } catch (error) {
+      if (store.get().catalog.length === 0) throw error
+      logger.warn?.(`dsh-wb-free-model: discovery refresh failed, using the cached catalog (${error?.message ?? error})`)
+    }
     const state = store.get()
     return [
       { id: AUTO_MODEL_ID, name: AUTO_MODEL_NAME, contextWindow: 131_072, maxTokens: 8_192 },
@@ -133,6 +144,21 @@ export function apply(ctx, config = {}) {
       })),
     ]
   })
+
+  /**
+   * Re-announce both registrations after a lane toggle. dsh-llm publishes
+   * `llm/adapters-updated` on every `replace`, "exactly like a first
+   * registration", which makes the harness re-query adapter.listModels() —
+   * that is how withdrawn models actually disappear from the selector.
+   */
+  function broadcast() {
+    try { registration.replace([ROUTE]) } catch (error) {
+      logger.warn?.(`dsh-wb-free-model: adapter re-announce failed: ${error?.message ?? error}`)
+    }
+    try { directory?.replace?.(directoryEntries) } catch (error) {
+      logger.warn?.(`dsh-wb-free-model: provider directory re-announce failed: ${error?.message ?? error}`)
+    }
+  }
   ctx.on?.('loader/volatile-update', () => {
     try { registration.replace([ROUTE]) } catch { /* a disposed registration means teardown */ }
   })
@@ -153,23 +179,54 @@ export function apply(ctx, config = {}) {
           return sendJSON(res, 415, { error: 'application/json required' })
         }
         const body = await readJSON(req)
+        const disabled = () => sendJSON(res, 409, {
+          started: false,
+          reason: 'disabled',
+          error: 'WB Free Model 已在设置里关闭',
+          code: 'CONFIG_DISABLED',
+          ...service.snapshot(),
+        })
         if (route === '/refresh') {
-          const catalog = await service.refreshCatalog({ force: true })
-          if (body.probe === true) void service.startProbes({ concurrency: body.concurrency }).catch(() => {})
-          return sendJSON(res, 200, { ok: true, models: catalog.length, ...service.snapshot() })
+          if (!service.enabled) return disabled()
+          // Fire-and-forget like /probe: a cold start can legitimately take
+          // minutes (runtime download), far beyond any client's patience, and
+          // the connection must not decide whether the refresh finishes.
+          // Failures land in snapshot.lastError; clients poll /status.
+          void service.refreshCatalog()
+            .then(() => {
+              if (body.probe === true) return service.startProbes({ concurrency: body.concurrency })
+            })
+            .catch(() => {})
+          return sendJSON(res, 202, { started: true, ...service.snapshot() })
         }
         if (route === '/probe') {
+          if (!service.enabled) return disabled()
           if (typeof body.id === 'string' && body.id !== '') {
+            if (service.isProbingModel(body.id)) {
+              return sendJSON(res, 409, { started: false, reason: 'in-flight', id: body.id, error: '该模型正在检测中', code: 'PROBE_IN_PROGRESS', ...service.snapshot() })
+            }
+            if (!service.canStartSingleProbe()) {
+              return sendJSON(res, 409, { started: false, reason: 'busy', id: body.id, error: '单模型检测并发已满，请稍后再试', code: 'PROBE_BUSY', ...service.snapshot() })
+            }
             void service.probeOne(body.id).catch(error => {
               logger.warn?.(`dsh-wb-free-model: single probe failed: ${error?.message ?? error}`)
             })
             return sendJSON(res, 202, { started: true, id: body.id, ...service.snapshot() })
           }
-          if (service.probing) return sendJSON(res, 409, { started: false, ...service.snapshot() })
+          if (service.probing) {
+            return sendJSON(res, 409, {
+              started: false,
+              reason: 'probing',
+              error: '已有检测在进行中，请等当前检测完成',
+              code: 'PROBE_IN_PROGRESS',
+              ...service.snapshot(),
+            })
+          }
           void service.startProbes({ concurrency: body.concurrency }).catch(() => {})
           return sendJSON(res, 202, { started: true, ...service.snapshot() })
         }
         if (route === '/retry') {
+          if (!service.enabled) return disabled()
           if (typeof body.id === 'string' && body.id !== '') {
             store.dropResult(body.id)
             store.update({ disabled: store.get().disabled.filter(id => id !== body.id) })
@@ -184,8 +241,13 @@ export function apply(ctx, config = {}) {
           const patch = {}
           if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
           if (typeof body.probeOnBoot === 'boolean') patch.probeOnBoot = body.probeOnBoot
+          const wasEnabled = store.get().enabled !== false
           store.update(patch)
           await store.flush()
+          const isEnabled = store.get().enabled !== false
+          if (typeof body.enabled === 'boolean' && wasEnabled !== isEnabled) {
+            await toggleLane(isEnabled)
+          }
           return sendJSON(res, 200, { ok: true, ...service.snapshot() })
         }
         return sendJSON(res, 404, { error: 'not found' })
@@ -201,34 +263,75 @@ export function apply(ctx, config = {}) {
   // ── lifecycle ────────────────────────────────────────────────────────────────
   ctx.effect(() => {
     void boot()
-    return () => {
+    return async () => {
       disposed = true
       service.dispose()
       store.dispose()
-      return runtime.stop()
+      await runtime.stop()
+      // The reversible stop keeps the process-exit hook armed for crashes;
+      // teardown is final, so release the hook (keeps reloads from stacking them).
+      runtime.dispose()
     }
   }, 'dsh-wb-free-model: lifecycle')
 
   async function boot() {
     try {
-      await service.refreshCatalog({ force: true })
-      if (disposed) return
-      if (store.get().probeOnBoot === false) {
-        logger.info?.('dsh-wb-free-model: boot probe disabled in settings')
+      // A disabled lane stays fully down across restarts: no runtime child, no
+      // catalog refresh, no probes, until the user re-enables it.
+      if (!service.enabled) {
+        logger.info?.('dsh-wb-free-model: lane is disabled in settings; runtime stays down until re-enabled')
         return
       }
-      const results = Object.values(store.get().results)
-      const newest = results.length === 0 ? 0 : Math.max(...results.map(result => Number(result?.at ?? 0)))
-      const fresh = results.length > 0 && Date.now() - newest < 12 * 60 * 60 * 1000
-      const anyPassed = results.some(result => result?.ok === true)
-      if (fresh && anyPassed) return
-      // Probes are sequential, rate-limited completions; two workers keep the
-      // boot responsive without hammering either gateway.
-      void service.startProbes({ concurrency: config.probeConcurrency ?? 2 }).catch(error => {
-        logger.warn?.(`dsh-wb-free-model: boot probe failed: ${error?.message ?? error}`)
-      })
+      await startLane()
     } catch (error) {
       logger.warn?.(`dsh-wb-free-model: startup incomplete: ${error?.message ?? error}`)
     }
+  }
+
+  /** The existing start path, shared by boot and re-enabling: refresh → probes → publish. */
+  async function startLane() {
+    await service.refreshCatalog()
+    if (disposed || !service.enabled) return
+    if (store.get().probeOnBoot === false) {
+      logger.info?.('dsh-wb-free-model: boot probe disabled in settings')
+      return
+    }
+    // Freshness counts probe outcomes only: a request success from a previous
+    // session must not mask models that were never (or adversely) probed.
+    const probed = Object.values(store.get().results).filter(result => result?.source === 'probe')
+    const newest = probed.length === 0 ? 0 : Math.max(...probed.map(result => Number(result?.at ?? 0)))
+    const fresh = probed.length > 0 && Date.now() - newest < 12 * 60 * 60 * 1000
+    const anyPassed = probed.some(result => result?.ok === true)
+    if (fresh && anyPassed) return
+    // Probes are sequential, rate-limited completions; two workers keep the
+    // boot responsive without hammering either gateway.
+    void service.startProbes({ concurrency: config.probeConcurrency ?? 2 }).catch(error => {
+      logger.warn?.(`dsh-wb-free-model: boot probe failed: ${error?.message ?? error}`)
+    })
+  }
+
+  // Toggle side effects run one at a time so rapid double-toggles can never
+  // race a stop against a fresh boot.
+  let toggleChain = Promise.resolve()
+  function toggleLane(enable) {
+    const task = toggleChain.then(() => enable ? enableLane() : disableLane())
+    toggleChain = task.catch(() => {})
+    return task
+  }
+
+  async function disableLane() {
+    broadcast()
+    await service.deactivate()
+    logger.info?.('dsh-wb-free-model: lane disabled; models withdrawn and runtime stopped')
+  }
+
+  function enableLane() {
+    broadcast()
+    // The start path runs in the background: a cold boot may download the
+    // runtime, and the settings response must not wait on it. /status reflects
+    // progress (runtime.starting, refreshing, models appearing).
+    void startLane().catch(error => {
+      logger.warn?.(`dsh-wb-free-model: lane start failed: ${error?.message ?? error}`)
+    })
   }
 }

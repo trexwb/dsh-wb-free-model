@@ -77,6 +77,9 @@ export class ModelService {
     this.probing = false
     this.inflight = 0
     this.probeRun = undefined
+    this.probingIds = new Set()
+    this.probeControllers = new Set()
+    this.singleProbes = 0
     this.disposed = false
     this.lastError = ''
   }
@@ -95,37 +98,74 @@ export class ModelService {
 
   /** Discovery is cached; refresh when empty, stale, or forced. */
   async ensureCatalog({ force = false } = {}) {
+    if (!this.enabled) {
+      // A disabled lane never starts the runtime — not even for a stale or
+      // empty catalog. Callers serve whatever cache exists.
+      return this.store.get().catalog
+    }
     const state = this.store.get()
     const stale = Date.now() - Number(state.catalogAt ?? 0) > 60 * 60 * 1000
     if (!force && state.catalog.length > 0 && !stale) return state.catalog
-    return this.refreshCatalog({ force: true })
+    return this.refreshCatalog()
   }
 
-  refreshCatalog({ force = false } = {}) {
-    if (!force && this.refreshing !== undefined) return this.refreshing
+  async refreshCatalog() {
+    if (!this.enabled) {
+      throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
+    }
+    // Every caller wants fresh data; an in-flight refresh serves them all
+    // instead of pulling /provider twice during startup.
+    if (this.refreshing !== undefined) return this.refreshing
     const task = (async () => {
-      const backend = await this.runtime.ensure()
-      const providers = await backend.providers()
-      const catalog = discoverModels(providers)
-      if (catalog.length === 0) {
-        throw new ModelError('OpenCode returned no keyless free models', { code: 'EMPTY_RESPONSE' })
+      try {
+        const backend = await this.runtime.ensure({ shouldRetry: () => this.enabled && !this.disposed })
+        // Each await can span a lane switch: a refresh must never write state
+        // (or leave a runtime it booted) for a lane that is now disabled.
+        if (!this.enabled || this.disposed) {
+          throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
+        }
+        const providers = await backend.providers()
+        if (!this.enabled || this.disposed) {
+          throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
+        }
+        const catalog = discoverModels(providers)
+        if (catalog.length === 0) {
+          throw new ModelError('OpenCode returned no keyless free models', { code: 'EMPTY_RESPONSE' })
+        }
+        this.store.setCatalog(catalog)
+        await this.store.flush()
+        this.lastError = ''
+        this.logger?.info?.(`dsh-wb-free-model: discovered ${catalog.length} free models`)
+        return catalog
+      } catch (error) {
+        // Surface catalog-level failures on the settings page (runtime.error
+        // alone never covers "runtime ready but /provider failing"). A disable
+        // is not a failure worth reporting.
+        if (error?.code !== 'CONFIG_DISABLED') this.lastError = error?.message ?? String(error)
+        throw error
       }
-      this.store.setCatalog(catalog)
-      await this.store.flush()
-      this.lastError = ''
-      this.logger?.info?.(`dsh-wb-free-model: discovered ${catalog.length} free models`)
-      return catalog
     })()
     this.refreshing = task.finally(() => { this.refreshing = undefined })
     return this.refreshing
   }
 
-  /** Best-effort background refresh; failures surface through the settings summary. */
-  backgroundRefresh() {
-    void this.refreshCatalog({ force: true }).catch(error => {
-      this.lastError = error?.message ?? String(error)
-      this.logger?.warn?.(`dsh-wb-free-model: catalog refresh failed: ${this.lastError}`)
-    })
+  /** Stop-the-lane side effects: abort probes, then release the runtime child. */
+  async deactivate() {
+    for (const controller of this.probeControllers) {
+      try { controller.abort(new Error('WB Free Model 已关闭')) } catch { /* ignore */ }
+    }
+    this.probeControllers.clear()
+    await this.runtime.stop()
+    this.logger?.info?.('dsh-wb-free-model: lane deactivated; runtime stopped')
+  }
+
+  isProbingModel(modelId) {
+    return this.probingIds.has(modelId)
+  }
+
+  /** Whether one more single-model probe may start right now. */
+  canStartSingleProbe() {
+    return this.singleProbes < Math.max(1, this.config.probeConcurrency ?? 2)
   }
 
   listModels() {
@@ -210,9 +250,22 @@ export class ModelService {
    * Returns `{content, calls, chatOnly, usage, finish, modelId}`.
    */
   async complete({ modelId, messages, system, tools, effort, signal, timeoutMs = REQUEST_TIMEOUT_MS }) {
-    if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED' })
+    if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
-    await this.ensureCatalog()
+    try {
+      await this.ensureCatalog()
+    } catch (error) {
+      // The cached catalog already passed its probes; a failed refresh must not
+      // turn every request into a hard failure while the cache can serve.
+      if (this.store.get().catalog.length === 0) throw error
+      this.logger?.warn?.(`dsh-wb-free-model: catalog refresh failed, serving the cached catalog (${error?.message ?? error})`)
+    }
+    // A disable that raced the refresh above must not slip through the swallowed
+    // failure and revive the runtime via ensure() below. Re-check everything
+    // that may have changed while we awaited.
+    if (this.disposed) throw new ModelError('WB Free Model 插件已卸载', { code: 'CONFIG_DISABLED', status: 409 })
+    if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
+    if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
     const targetId = modelId === 'auto' ? this.autoModelId({ messages, tools, effort }) : modelId
     if (targetId === undefined) throw new ModelError('没有可用的免费模型；请先刷新目录或运行探测', { code: 'MODEL_UNAVAILABLE' })
     const entry = this.resolveEntry(targetId)
@@ -234,7 +287,11 @@ export class ModelService {
 
     const prepared = prepareBridge({ messages, tools, imagesAllowed: entry.images === true, resolveImage: this.resolveImage })
     const chatOnly = prepared.chatOnly
-    const backend = await this.runtime.ensure()
+    // The retry predicate is evaluated at retry time: a lane disabled while a
+    // cancelled boot was pending must never respawn the runtime here.
+    const backend = await this.runtime.ensure({
+      shouldRetry: () => this.enabled && !this.disposed && signal?.aborted !== true,
+    })
     const started = Date.now()
     const sessionId = await backend.createSession()
     const permissionState = { native: false }
@@ -309,6 +366,21 @@ export class ModelService {
       this.recordOutcome(entry.id, { ok: true, ms: elapsed, source: 'request' })
       const finish = reply.calls.length > 0 ? 'tool-calls' : (info?.finish === 'length' ? 'max-tokens' : 'stop')
       return { content: reply.content, calls: reply.calls, chatOnly, usage, finish, modelId: entry.id, elapsed }
+    } catch (error) {
+      // A real request failure is evidence about the model: record it so the
+      // weights, auto selection and the settings page can react. User
+      // cancellation is not the model's fault, and neither is a lane switched
+      // off (or teardown) mid-request killing the runtime under us.
+      if (error?.code !== 'ABORTED' && signal?.aborted !== true && this.enabled && !this.disposed) {
+        this.recordOutcome(entry.id, {
+          ok: false,
+          ms: Date.now() - started,
+          source: 'request',
+          code: error?.code ?? 'SERVER',
+          message: error?.message ?? String(error),
+        })
+      }
+      throw error
     } finally {
       signal?.removeEventListener('abort', onAbort)
       watcher.stop()
@@ -355,9 +427,13 @@ export class ModelService {
           for (const permission of Array.isArray(pending) ? pending : []) {
             if (permission?.sessionID !== undefined && permission.sessionID !== sessionId) continue
             if (chatOnly) state.native = true
+            // Record the callID on sight, not on reply success: the reply may
+            // fail because the permission already settled (e.g. another reject
+            // settled the whole pending set). The call was still blocked, so
+            // complete() must not misjudge its error part as "unexpected".
+            if (permission?.callID !== undefined) state.rejected.add(permission.callID)
             try {
               await backend.replyPermission(permission, 'reject', 'WB Free Model blocks native tool execution; return the action as an external tool call.')
-              if (permission?.callID !== undefined) state.rejected.add(permission.callID)
             } catch { /* the request may have settled already */ }
           }
         } catch { /* permission polling is best-effort */ }
@@ -397,14 +473,25 @@ export class ModelService {
     if (this.probing) return { started: false }
     if (!this.enabled) return { started: false, reason: 'disabled' }
     this.probing = true
+    const controller = new AbortController()
+    this.probeControllers.add(controller)
     const startedAt = Date.now()
     const queue = this.store.get().catalog.filter(model => !this.store.get().disabled.includes(model.id))
     const total = queue.length
     let done = 0
     const worker = async () => {
-      while (queue.length > 0 && !this.disposed) {
+      // Re-check enabled and the batch's own signal on every turn: switching
+      // the lane off mid-run must stop the queue quietly instead of persisting
+      // CONFIG_DISABLED failures.
+      while (queue.length > 0 && !this.disposed && this.enabled && !controller.signal.aborted) {
         const model = queue.shift()
-        await this.runProbe(model, signal)
+        if (this.probingIds.has(model.id)) { done += 1; continue }
+        this.probingIds.add(model.id)
+        try {
+          await this.runProbe(model, signal ?? controller.signal)
+        } finally {
+          this.probingIds.delete(model.id)
+        }
         done += 1
       }
     }
@@ -414,6 +501,7 @@ export class ModelService {
     } finally {
       this.probing = false
       this.probeRun = undefined
+      this.probeControllers.delete(controller)
       await this.store.flush()
     }
     return { started: true }
@@ -421,19 +509,34 @@ export class ModelService {
 
   /** Probe one model (settings page retry). */
   async probeOne(modelId, signal) {
-    if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED' })
+    if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     const model = this.resolveEntry(modelId)
     if (model === undefined) throw new ModelError(`未知模型 "${modelId}"`, { code: 'MODEL_NOT_FOUND', status: 404 })
+    if (this.probingIds.has(model.id)) {
+      throw new ModelError('该模型正在检测中，请等当前检测完成', { code: 'PROBE_IN_PROGRESS', status: 409 })
+    }
+    const limit = Math.max(1, this.config.probeConcurrency ?? 2)
+    if (this.singleProbes >= limit) {
+      throw new ModelError('单模型检测并发已满，请稍后再试', { code: 'PROBE_BUSY', status: 409 })
+    }
     this.inflight += 1
+    this.singleProbes += 1
+    const controller = new AbortController()
+    this.probeControllers.add(controller)
+    this.probingIds.add(model.id)
     try {
-      return await this.runProbe(model, signal)
+      return await this.runProbe(model, signal ?? controller.signal)
     } finally {
       this.inflight -= 1
+      this.singleProbes -= 1
+      this.probeControllers.delete(controller)
+      this.probingIds.delete(model.id)
       await this.store.flush()
     }
   }
 
   async runProbe(model, signal) {
+    if (!this.enabled || this.disposed) return undefined
     let result
     try {
       result = await probeModel({
@@ -451,6 +554,10 @@ export class ModelService {
     } catch (error) {
       result = { ok: false, code: error?.code ?? 'SERVER', message: error?.message ?? String(error), ms: 0 }
     }
+    // A lane switched off mid-probe (or teardown) owns the outcome: drop it
+    // instead of persisting a CONFIG_DISABLED "probe failure" that would hide
+    // the model from the selector until a manual retry.
+    if (!this.enabled || this.disposed || result?.code === 'CONFIG_DISABLED') return result
     this.store.setResult(model.id, {
       ...result,
       weight: result.ok === true ? nextWeight(undefined, true, 'probe', result.ms) : 0,
@@ -461,20 +568,31 @@ export class ModelService {
 
   dispose() {
     this.disposed = true
+    for (const controller of this.probeControllers) {
+      try { controller.abort(new Error('WB Free Model 插件已卸载')) } catch { /* ignore */ }
+    }
   }
 
   snapshot() {
     const state = this.store.get()
     const runtime = this.runtime.status()
+    const enabled = state.enabled !== false
     return {
-      enabled: state.enabled !== false,
+      enabled,
       probeOnBoot: state.probeOnBoot !== false,
       runtime,
       catalogAt: state.catalogAt,
       lastError: this.lastError || runtime.error || '',
-      probing: this.probing || this.inflight > 0,
+      refreshing: this.refreshing !== undefined,
+      probing: enabled && (this.probing || this.inflight > 0),
       probeProgress: this.probeRun === undefined ? undefined : { total: this.probeRun.total, done: this.probeRun.done() },
-      models: state.catalog.map(model => ({
+      probingIds: enabled ? [...this.probingIds] : [],
+      // Client retry bursts pace themselves against the single-probe limit.
+      probeConcurrency: Math.max(1, this.config.probeConcurrency ?? 2),
+      probeSlotsBusy: this.singleProbes,
+      // A disabled lane publishes nothing: the settings page mirrors the empty
+      // selector instead of listing models the harness can no longer route.
+      models: enabled ? state.catalog.map(model => ({
         id: model.id,
         name: model.name,
         context: model.context,
@@ -486,12 +604,12 @@ export class ModelService {
         disabled: state.disabled.includes(model.id),
         result: state.results[model.id],
         weight: weightOf(model, state.results[model.id]),
-      })),
-      auto: {
+      })) : [],
+      auto: enabled ? {
         id: 'auto',
         name: 'WB · auto',
         efforts: autoLevels(state.catalog),
-      },
+      } : undefined,
     }
   }
 }

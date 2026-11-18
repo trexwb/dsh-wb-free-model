@@ -5,6 +5,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { DATA_DIR_NAME } from './constants.js'
 
+/** Consecutive refreshes a model must be missing before its result is pruned. */
+const RESULT_PRUNE_MISSES = 3
+
 export function resolveDshHome() {
   const override = process.env.DSH_HOME
   return override && override.trim() !== '' ? path.resolve(override) : path.join(os.homedir(), '.dsh')
@@ -35,6 +38,10 @@ export class Store {
     this.chain = Promise.resolve()
     this.timer = undefined
     this.disposed = false
+    // Session-scoped: how many consecutive refreshes a result's model has been
+    // missing from the catalog. Transient upstream shrink must not wipe valid
+    // probe results; only a persistent departure prunes them.
+    this.missingCounts = new Map()
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
     try { fs.chmodSync(dataDir, 0o700) } catch { /* best effort on platforms without POSIX modes */ }
     this.load()
@@ -58,7 +65,10 @@ export class Store {
         disabled: Array.isArray(parsed.disabled) ? parsed.disabled : [],
       }
     } catch {
-      this.logger?.warn?.(`${DATA_DIR_NAME}: state.json is corrupt; starting empty`)
+      // Keep the unreadable file around for diagnosis instead of silently
+      // destroying it on the next write.
+      try { fs.renameSync(this.file, `${this.file}.bad`) } catch { /* leave as is */ }
+      this.logger?.warn?.(`${DATA_DIR_NAME}: state.json is corrupt; kept as state.json.bad and starting empty`)
     }
   }
 
@@ -72,7 +82,23 @@ export class Store {
   }
 
   setCatalog(catalog) {
-    this.state = { ...this.state, catalog, catalogAt: Date.now() }
+    // Prune results for models that left the catalog — but only after several
+    // consecutive refreshes confirm the departure, so one flaky /provider
+    // response cannot discard weights and chat-only marks for models that are
+    // back on the next refresh.
+    const ids = new Set(catalog.map(model => model.id))
+    const results = {}
+    for (const [id, result] of Object.entries(this.state.results)) {
+      if (ids.has(id)) {
+        this.missingCounts.delete(id)
+        results[id] = result
+        continue
+      }
+      const missing = (this.missingCounts.get(id) ?? 0) + 1
+      this.missingCounts.set(id, missing)
+      if (missing < RESULT_PRUNE_MISSES) results[id] = result
+    }
+    this.state = { ...this.state, catalog, catalogAt: Date.now(), results }
     this.schedule()
   }
 

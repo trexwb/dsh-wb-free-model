@@ -31,6 +31,7 @@ import {
 import { Backend } from './backend.js'
 
 const DEFAULT_REGISTRY = 'https://registry.npmjs.org'
+const START_CANCELLED_MESSAGE = 'OpenCode startup cancelled by shutdown'
 
 function sleep(ms) {
   return new Promise(resolve => { const timer = setTimeout(resolve, ms); timer.unref?.() })
@@ -271,6 +272,8 @@ export class Runtime {
     this.config = config ?? {}
     this.logger = logger
     this.starting = undefined
+    this.stopPromise = undefined
+    this.startAbort = undefined
     this.child = undefined
     this.logFd = undefined
     this.backend = undefined
@@ -292,16 +295,50 @@ export class Runtime {
     }
   }
 
-  /** Idempotent: concurrent callers await the same boot. */
-  ensure() {
+  /**
+   * Idempotent: concurrent callers await the same boot; a stop in flight is
+   * awaited first. A boot cancelled by a stop that has since settled may be
+   * retried once — but only when the CALLER still wants a boot (`shouldRetry`,
+   * evaluated at retry time), so a disable can never respawn through this path.
+   */
+  ensure({ shouldRetry } = {}) {
     if (this.backend !== undefined) return Promise.resolve(this.backend)
-    if (this.starting !== undefined) return this.starting
-    this.starting = this.start()
+    if (this.starting !== undefined) {
+      const joined = this.starting
+      return joined.catch(error => this.retryCancelled(error, shouldRetry))
+    }
+    if (this.stopping) {
+      // A stop owns the child slot right now; restarting mid-kill would race
+      // the killer, so wait for it to settle and then re-check.
+      const settle = this.stopPromise === undefined ? Promise.resolve() : this.stopPromise.then(() => {}, () => {})
+      return settle.then(() => this.ensure({ shouldRetry }))
+    }
+    const started = this.start()
       .finally(() => { this.starting = undefined })
-    return this.starting
+    this.starting = started
+    return started.catch(error => this.retryCancelled(error, shouldRetry))
+  }
+
+  retryCancelled(error, shouldRetry) {
+    // A doomed boot can reject up to one health poll after its stop settled;
+    // a caller arriving then expects a real boot. Retry from the caller's
+    // context, never from the dying boot itself.
+    if (!this.stopping && error?.message === START_CANCELLED_MESSAGE
+      && (shouldRetry === undefined || shouldRetry() === true)) {
+      return this.ensure({ shouldRetry })
+    }
+    throw error
+  }
+
+  /** Final teardown: stop() keeps the exit hook reversible; dispose removes it. */
+  dispose() {
+    process.removeListener('exit', this.exitHook)
   }
 
   async start() {
+    const startAbort = new AbortController()
+    this.startAbort = startAbort
+    const cancelled = () => startAbort.signal.aborted
     this.error = ''
     const root = path.join(this.dataDir, 'opencode')
     for (const name of ['config', 'data', 'cache', 'state', 'project']) {
@@ -316,11 +353,15 @@ export class Runtime {
 
     let binary
     try {
-      binary = await resolveBinary({ dataDir: this.dataDir, config: this.config, logger: this.logger })
+      binary = await resolveBinary({
+        dataDir: this.dataDir, config: this.config, logger: this.logger, signal: startAbort.signal,
+      })
     } catch (error) {
+      if (cancelled()) throw new Error(START_CANCELLED_MESSAGE)
       this.error = `OpenCode runtime unavailable: ${error?.message ?? error}`
       throw new Error(this.error)
     }
+    if (cancelled()) throw new Error(START_CANCELLED_MESSAGE)
     this.version = binary.version
     this.logger?.info?.(`dsh-wb-free-model: using OpenCode ${binary.version} (${binary.source})`)
 
@@ -338,6 +379,12 @@ export class Runtime {
     env.OPENCODE_DISABLE_EXTERNAL_SKILLS = 'true'
     env.OPENCODE_CONFIG_CONTENT = JSON.stringify(isolatedConfig())
 
+    // A crash-restart cycle reuses this instance: close the previous fd before
+    // replacing it, or every crash leaks one descriptor.
+    if (this.logFd !== undefined) {
+      try { fs.closeSync(this.logFd) } catch { /* ignore */ }
+      this.logFd = undefined
+    }
     this.logFd = fs.openSync(logFile, 'a', 0o600)
     const child = spawn(binary.file, ['serve', '--pure', '--hostname', '127.0.0.1', '--port', String(port)], {
       cwd: path.join(root, 'project'),
@@ -355,30 +402,45 @@ export class Runtime {
     const backend = new Backend({ baseURL, password, logger: this.logger })
     for (let attempt = 0; attempt < HEALTH_ATTEMPTS; attempt += 1) {
       if (exited) {
+        // Our own shutdown SIGTERMed the boot: surface the cancellation, not a
+        // crash, so callers can tell the two apart.
+        if (cancelled()) {
+          this.killSync()
+          throw new Error(START_CANCELLED_MESSAGE)
+        }
         this.error = `OpenCode exited during startup. ${logTail(logFile)}`
         this.killSync()
         throw new Error(this.error)
       }
+      let health
       try {
-        const health = await backend.health()
-        if (health !== undefined) {
-          if (health.version !== undefined && String(health.version) !== this.version) {
-            this.logger?.warn?.(`dsh-wb-free-model: OpenCode reports ${health.version} but ${this.version} was probed`)
-          }
-          this.backend = backend
-          this.port = port
-          child.once('exit', code => {
-            if (this.stopping || this.child !== child) return
-            this.backend = undefined
-            this.port = 0
-            this.error = `OpenCode exited unexpectedly (${code ?? 'signal'}). ${logTail(logFile)}`
-            this.logger?.warn?.(`dsh-wb-free-model: ${this.error}`)
-          })
-          this.logger?.info?.(`dsh-wb-free-model: OpenCode ${health.version ?? this.version} is ready on 127.0.0.1:${port}`)
-          return backend
-        }
+        health = await backend.health()
       } catch { /* not ready yet */ }
-      await sleep(HEALTH_POLL_MS)
+      if (cancelled()) {
+        this.killSync()
+        throw new Error(START_CANCELLED_MESSAGE)
+      }
+      if (health !== undefined) {
+        if (health.version !== undefined && String(health.version) !== this.version) {
+          this.logger?.warn?.(`dsh-wb-free-model: OpenCode reports ${health.version} but ${this.version} was probed`)
+        }
+        this.backend = backend
+        this.port = port
+        child.once('exit', code => {
+          if (this.stopping || this.child !== child) return
+          this.backend = undefined
+          this.port = 0
+          this.error = `OpenCode exited unexpectedly (${code ?? 'signal'}). ${logTail(logFile)}`
+          this.logger?.warn?.(`dsh-wb-free-model: ${this.error}`)
+        })
+        this.logger?.info?.(`dsh-wb-free-model: OpenCode ${health.version ?? this.version} is ready on 127.0.0.1:${port}`)
+        return backend
+      }
+      // A ref'd timer on purpose: while a boot is in flight (even one whose
+      // child was just killed by a racing stop), it must keep the host process
+      // alive until it settles — an unref'd sleep here can let the loop drain
+      // and silently drop the boot.
+      await sleepRef(HEALTH_POLL_MS)
     }
     this.error = 'OpenCode startup timed out'
     this.killSync()
@@ -397,13 +459,30 @@ export class Runtime {
     this.child = undefined
   }
 
-  async stop() {
-    if (this.stopping) return
+  /**
+   * Stop the child and release the port. Reversible: `stopping` is reset when
+   * the kill settles and the process-exit hook stays registered, so a later
+   * `ensure()` boots a child that again has crash cleanup and exit kills.
+   * Concurrent calls share one stop; `ensure()` awaits it before respawning.
+   */
+  stop() {
+    if (this.stopping && this.stopPromise !== undefined) return this.stopPromise
     this.stopping = true
-    process.removeListener('exit', this.exitHook)
+    this.stopPromise = this.performStop().finally(() => {
+      this.stopping = false
+      this.stopPromise = undefined
+    })
+    return this.stopPromise
+  }
+
+  async performStop() {
+    // Cancel an in-flight boot first: it must never commit a backend (or leave
+    // a spawned child) after the stop below has released the slot.
+    this.startAbort?.abort(new Error('OpenCode startup cancelled by shutdown'))
     this.backend = undefined
     const child = this.child
     this.child = undefined
+    this.port = 0
     try {
       if (child !== undefined && child.exitCode === null && child.signalCode === null) {
         try { child.kill('SIGTERM') } catch { /* ignore */ }
@@ -420,6 +499,7 @@ export class Runtime {
         try { fs.closeSync(this.logFd) } catch { /* ignore */ }
         this.logFd = undefined
       }
+      this.error = ''
     }
   }
 }
