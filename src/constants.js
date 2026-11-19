@@ -2,7 +2,12 @@
 
 export const PLUGIN_ID = 'dsh-wb-free-model'
 export const DATA_DIR_NAME = 'dsh-wb-free-model'
-export const ROUTE = 'wbbridge'
+// Provider id under which every free model is published. Must stay unique
+// among the adapters the host registers: the official WB Bridge plugin claims
+// `wbbridge`, so this lane ships under its own id instead — a duplicate id
+// makes registerAdapter throw and, because apply() mounts the settings API
+// after the adapter, silently kills the /status route with it.
+export const ROUTE = 'dshfreemodels'
 export const ROUTE_LABEL = 'WB Free Model'
 export const AUTO_MODEL_ID = 'auto'
 export const AUTO_MODEL_NAME = 'WB · auto'
@@ -44,15 +49,24 @@ export const DEFAULT_MAX_TOKENS = 32_768
 export const FALLBACK_MAX_TOKENS = 8_192
 
 /**
- * The free lane's quota is accounted per egress IP. A real 429 opens a window;
- * when the response carries no usable Retry-After, assume this one rather than
- * re-asking the wall.
+ * Fallback window when a 429 carries no usable Retry-After. The real limit is a
+ * single global anonymous pool reset at UTC midnight — not per IP, session,
+ * model or transport fingerprint — so the gateway normally tells us the exact
+ * remaining seconds and this default is only a safety net.
  */
 export const LANE_QUOTA_DEFAULT_MS = 6 * 60 * 60 * 1000
 
 export const PROBE_WEIGHT_SLOW_MS = 30_000
 export const PROBE_WEIGHT_PENALTY = 20
+// A request that hits a rate limit / quota lowers that model's weight by this
+// much until the next successful request or probe re-establishes it.
+export const LIMIT_WEIGHT_PENALTY = 30
+export const WEIGHT_FLOOR = 10
 export const DEFAULT_WEIGHT = 100
+// Models below this weight get a scheduled probe every CHECK_INTERVAL_MS,
+// measured from their last actual probe (not from routine usage), so a low
+// weight cannot hide a model from the maintenance cadence forever.
+export const LOW_WEIGHT_THRESHOLD = 20
 
 /** Automatic health re-check budget per model. */
 export const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000

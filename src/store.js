@@ -26,6 +26,11 @@ function initialState() {
     catalog: [],
     catalogAt: 0,
     results: {},
+    // Free-lane quota breaker, persisted so a DSH restart does not reset the
+    // window and immediately hammer an egress the gateway already limited.
+    // The rest of the breaker (laneLockedMessage) stays per-session.
+    quotaUntil: 0,
+    quotaMessage: '',
     disabled: [],
     // Models moved to the recycle bin (system suggestion confirmed by the
     // user, or direct action): unpublished, unprobed, restorable. Kept as a

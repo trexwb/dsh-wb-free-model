@@ -139,8 +139,11 @@ window.__ModuleLoader__.load({
       if (result?.ok === true) return { label: '可用', tone: 'ok' }
       const streak = Number(model.failStreak ?? 0)
       const streakNote = streak >= 2 ? ` · 连败 ${streak}` : ''
-      if (result?.source === 'probe' && result?.ok === false) return { label: `探测失败${streakNote}`, tone: 'bad' }
+      // A lane-level limited result (quota/gate/transport) is a shared "wait"
+      // signal, not a failed probe — show it as 受限 before the probe-failure
+      // branch so the badge matches what a real request reports in chat.
       if (result?.ok === false && result?.state === 'limited') return { label: `受限${streakNote}`, tone: 'warn' }
+      if (result?.source === 'probe' && result?.ok === false) return { label: `探测失败${streakNote}`, tone: 'bad' }
       if (result?.ok === false && result?.state === 'down') return { label: `不可用${streakNote}`, tone: 'bad' }
       if (result?.ok === false) return { label: '最近请求失败', tone: 'warn' }
       return { label: '未探测', tone: 'muted' }
@@ -298,7 +301,7 @@ window.__ModuleLoader__.load({
                 border: `1px solid ${COLORS.warn}`, fontSize: 12, color: COLORS.warn,
               },
             },
-            `免费车道（OC · 前缀）触发了上游的出口配额：${data.laneQuotaMessage || '上游按出口 IP 计免费配额'}。窗口结束前免费车道的请求会在本地直接拒绝，不会去撞墙；Kilo 车道（KL · 前缀）不受影响。切换网络出口后可用「刷新目录」重新探测。`)
+            `OpenCode 匿名免费池（OC · 前缀）的当日公共配额已用尽：${data.laneQuotaMessage || '上游返回 Free usage limit reached'}。该池由全球匿名请求共享、按 UTC 日重置，与本机网络出口、IP、客户端指纹无关，换网络或重启都无法提前恢复；窗口结束前 OC 请求在本地直接拒绝。窗口到 ${new Date(data.laneQuotaUntil).toLocaleString()} 自动结束，或改用 KL · 前缀模型 / WB · auto（已自动切到 Kilo）。`)
           : null,
         data !== undefined && laneEnabled && data.laneLocked
           ? h('div', {

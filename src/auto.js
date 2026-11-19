@@ -1,6 +1,6 @@
 /** `WB · auto` weighted selection (ported from wbBridge `auto.rs`). */
 
-import { DEFAULT_WEIGHT, PROBE_WEIGHT_PENALTY, PROBE_WEIGHT_SLOW_MS } from './constants.js'
+import { DEFAULT_WEIGHT, LIMIT_WEIGHT_PENALTY, LOW_WEIGHT_THRESHOLD, PROBE_WEIGHT_PENALTY, PROBE_WEIGHT_SLOW_MS, WEIGHT_FLOOR } from './constants.js'
 import { acceptsEffort } from './reasoning.js'
 
 export { autoLevels } from './reasoning.js'
@@ -34,6 +34,17 @@ export function nextWeight(current, ok, source, durationMs) {
     return Math.max(decayedWeight(current ?? DEFAULT_WEIGHT, durationMs), probeWeight(durationMs))
   }
   return current
+}
+
+/**
+ * Weight after a request hit a rate limit / quota. Step it down by a fixed
+ * penalty but keep a floor so the model stays reachable as a last resort.
+ * The next successful request (nextWeight) or probe (probeWeight) replaces
+ * this value, so the demotion lasts only until the model proves itself again.
+ */
+export function limitedWeight(current) {
+  const base = typeof current === 'number' && Number.isFinite(current) ? current : DEFAULT_WEIGHT
+  return Math.max(WEIGHT_FLOOR, base - LIMIT_WEIGHT_PENALTY)
 }
 
 const RATE_LIMIT_PATTERN = /rate[ ._-]?limit|too many requests|quota|429/i
@@ -93,6 +104,31 @@ export function checkedAtOf(result, now = Date.now()) {
   return 0
 }
 
+/** Whether this model's weight is low enough to require the 24h recheck. */
+export function isLowWeight(result) {
+  return weightOf(undefined, result) < LOW_WEIGHT_THRESHOLD
+}
+
+/**
+ * The timestamp from which the 24h maintenance check is measured.
+ *
+ * Normal models anchor on `checkedAt` (any real health evidence, including a
+ * successful usage request). Low-weight models anchor on the last *probe*
+ * instead: a demoted model that keeps getting used would otherwise refresh
+ * `checkedAt` on every success and never become due, hiding it from the very
+ * recheck that could restore its weight. A probe always writes `probedAt`;
+ * legacy records without it fall back to `checkedAt`, keeping the migration
+ * harmless. A never-checked model (0) stays immediately due.
+ */
+export function checkAnchorOf(result, now = Date.now()) {
+  if (result === undefined || result === null) return 0
+  if (isLowWeight(result)) {
+    const probedAt = Number(result.probedAt ?? 0)
+    if (Number.isFinite(probedAt) && probedAt > 0) return Math.min(probedAt, now)
+  }
+  return checkedAtOf(result, now)
+}
+
 /**
  * Kept for diagnostics/snapshots only: the service no longer fans out a full
  * re-probe when every weight sits at 0. Recovery is driven by request
@@ -135,35 +171,31 @@ export function candidates(models, results, request) {
 }
 
 /**
- * Hysteresis for the fallback pool (used when no model has a passing probe or
- * request): a single 5xx/timeout/429 only shows in the UI — auto keeps using
- * the model. Two consecutive failures classified `limited`/`down` remove it
- * from that pool; a pool that would empty out keeps its unfiltered form, so
- * for every input the pick is a superset of the unfiltered behavior.
- */
-export function hysteresisPool(models, results) {
-  const filtered = models.filter(model => {
-    const result = results[model.id]
-    if (Number(result?.failStreak ?? 0) < 2) return true
-    const state = stateOf(result)
-    return state !== 'down' && state !== 'limited'
-  })
-  return filtered.length > 0 ? filtered : models
-}
-
-/**
  * Pick one fully-qualified model id. Prefers models whose last probe/request
  * succeeded; before any probe exists the whole catalog is eligible.
+ *
+ * Models whose health state is `limited` (quota spent) or `down` (a real model
+ * fault) are excluded from the random pool: routing a turn to them would just
+ * fail. When that leaves no candidate at all, fall back to the full domain so
+ * `auto` still has a choice — an empty pick would be worse than a best-effort
+ * retry, since a spent window can recover between the pick and the request.
+ * A lane-level result (state undefined, e.g. a transport error) is not a verdict
+ * on the model and stays eligible.
  */
 export function selectModel({ models, results, images = false, tools = false, effort, random = Math.random }) {
   if (models.length === 0) return undefined
   const validated = models.filter(model => results[model.id]?.ok === true)
   const domain = candidates(validated.length > 0 ? validated : models, results, { images, tools, effort })
   if (domain.length === 0) return undefined
-  // Hysteresis only reshapes the fallback pool: every model in the validated
-  // pool has failStreak 0 by construction (any failure writes ok:false), so
-  // filtering there could never remove anything.
-  const effective = validated.length > 0 ? domain : hysteresisPool(domain, results)
+  const healthy = domain.filter(model => {
+    const state = stateOf(results[model.id])
+    return state !== 'down' && state !== 'limited'
+  })
+  // Health excludes a known-bad model outright. Only fall back to the domain
+  // when every candidate is unhealthy — never pick one while a healthy model
+  // exists. (The fallback keeps `auto` usable across a shared egress outage,
+  // where recovery can happen between the pick and the request.)
+  const effective = healthy.length > 0 ? healthy : domain
   const max = Math.max(...effective.map(model => weightOf(model, results[model.id])))
   const top = effective.filter(model => weightOf(model, results[model.id]) === max)
   return top[Math.min(top.length - 1, Math.floor(random() * top.length))]?.id

@@ -7,8 +7,10 @@
  *
  * - `RegionError` — the model exists but this egress country is excluded; it
  *   feeds availability rather than a retry.
- * - `FreeUsageLimitError` / 429 — the per-egress quota is spent; retrying with
- *   a fresh session makes it worse, which is why session ids are stable.
+ * - `FreeUsageLimitError` / 429 — this client transport's free-tier bucket is
+ *   spent (the gateway buckets anonymous quota by transport fingerprint, not
+ *   by IP or session; see src/relay.js). Retrying with a fresh session makes
+ *   it worse, which is why session ids are stable.
  * - `ModelError` / "Model is unavailable" — the pooled account no longer
  *   routes that id at all.
  *
@@ -19,6 +21,7 @@
  */
 
 import { UPSTREAM_BASE } from './constants.js'
+import { relayFetch } from './relay.js'
 import { gatewayHeaders, truncateSession } from './upstream.js'
 
 /** Harness-neutral failure codes; the adapter's retry policy reads these. */
@@ -371,7 +374,10 @@ export async function postStreamed({ path, body, session, signal, onData, timeou
   const headers = gatewayHeaders({ session: canonical, project: canonical, anthropic: path.includes('/messages') })
   let response
   try {
-    response = await fetch(`${UPSTREAM_BASE}${path}`, {
+    // The relay (Bun transport) restores the genuine client fingerprint the
+    // gateway's free-tier buckets key on; it falls back to the direct fetch
+    // whenever no Bun is available, so this call site is transport-agnostic.
+    response = await relayFetch(`${UPSTREAM_BASE}${path}`, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -438,7 +444,7 @@ export async function getJson(path, { session, signal, timeoutMs = 15_000 } = {}
   const onCallerAbort = () => { callerAborted = true; controller.abort() }
   signal?.addEventListener('abort', onCallerAbort, { once: true })
   try {
-    const response = await fetch(`${UPSTREAM_BASE}${path}`, { headers, redirect: 'error', signal: controller.signal })
+    const response = await relayFetch(`${UPSTREAM_BASE}${path}`, { headers, redirect: 'error', signal: controller.signal })
     const text = await response.text()
     let payload
     try { payload = JSON.parse(text) } catch { payload = { error: { message: text.slice(0, 200) } } }
