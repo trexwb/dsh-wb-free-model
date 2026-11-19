@@ -1,5 +1,6 @@
 /** Construct transport metadata without retaining request-specific state. */
 import { createHash, randomBytes } from 'node:crypto'
+import { messageRequestID } from './identity.js'
 import { ANONYMOUS_CREDENTIAL, CLIENT_UA } from './version.js'
 
 export function projectID(project) {
@@ -17,7 +18,7 @@ export function traceHeaders() {
   return { traceparent: `00-${trace}-${span}-01`, b3: `${trace}-${span}-1-${parent}` }
 }
 
-export function gatewayHeaders({ session, childSession, project, accept, anthropic, userAgent } = {}) {
+export function gatewayHeaders({ session, childSession, project, accept, anthropic, userAgent, request } = {}) {
   const headers = {
     'content-type': 'application/json',
     authorization: `Bearer ${ANONYMOUS_CREDENTIAL}`,
@@ -25,9 +26,13 @@ export function gatewayHeaders({ session, childSession, project, accept, anthrop
     'x-opencode-client': 'cli',
     'x-opencode-session-id': childSession ?? session,
     'x-opencode-project': project === null || project === undefined ? stableProjectID(session) : projectID(project),
-    ...traceHeaders(),
   }
-  for (const key of ['x-session-affinity', 'x-session-id', 'x-opencode-session']) headers[key] = session
+  // One id per assistant message turn, in the real client's ULID shape — the
+  // captured 1.19.6 request carries `x-opencode-request: msg_<ulid>`; the
+  // retired bot header set (x-session-affinity / X-Session-Id / traceparent /
+  // b3) is what the gateway no longer sees from a genuine CLI.
+  headers['x-opencode-request'] = request ?? messageRequestID()
+  headers['x-opencode-session'] = session
   if (accept !== null) headers.accept = accept ?? '*/*'
   if (anthropic) headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14'
   return headers

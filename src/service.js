@@ -11,9 +11,10 @@
  * the ones their models emit as JSON, which the adapter hands to the harness.
  */
 
-import { autoLevels, checkedAtOf, classifyFailure, nextWeight, probeWeight, selectModel, stateOf, weightOf } from './auto.js'
+import { autoLevels, checkAnchorOf, checkedAtOf, classifyFailure, limitedWeight, nextWeight, probeWeight, selectModel, stateOf, weightOf } from './auto.js'
 import { buildCatalog, buildKiloCatalog, parseListing } from './catalog.js'
 import {
+  AUTO_MODEL_ID,
   CHECK_BATCH,
   CHECK_INTERVAL_MS,
   CHECK_SPREAD_MS,
@@ -23,6 +24,7 @@ import {
   LISTING_TIMEOUT_MS,
   RECYCLE_THRESHOLD,
   REQUEST_TIMEOUT_MS,
+  ROUTE,
   UPSTREAM_LISTING_PATH,
 } from './constants.js'
 import { CODE, getJson, postStreamed, UpstreamError } from './http.js'
@@ -51,6 +53,44 @@ export class ModelError extends Error {
   }
 }
 
+/**
+ * A probe result hides a model from the selector only when it says something
+ * about the model itself. A lane-level `limited` result (quota spent, client
+ * gate, transport break) is a shared condition, not a verdict on this model:
+ * it stays published and selectable, exactly as a failed real request does.
+ */
+function hidesModel(result) {
+  return result?.source === 'probe' && result?.ok === false && result?.state !== 'limited'
+}
+
+/**
+ * Which failures justify routing `auto` to another model. A model-level or
+ * lane-level refusal means this candidate cannot serve the turn right now, so
+ * the next candidate gets a chance. Request-shape errors (unsupported tools /
+ * images / effort) are not fixed by switching models and are not retried here;
+ * neither are abort/disabled, which must stop immediately.
+ */
+function failoverable(error) {
+  if (error === null || typeof error !== 'object') return true
+  if (error.code === 'ABORTED' || error.code === 'CONFIG_DISABLED') return false
+  if (error.code === 'INVALID_REQUEST' || error.code === 'MODEL_NOT_FOUND') return false
+  return true
+}
+
+/** Max models `auto` may try in one turn, so one bad batch cannot loop forever. */
+const AUTO_FAILOVER_LIMIT = 8
+
+/**
+ * The free-lane quota is accounted per egress IP, so a `limited` verdict on
+ * any single OC model really describes the whole lane. Unlike the in-memory
+ * window this evidence lives in state.json and survives a DSH restart — key
+ * for upgrades where no persisted quotaUntil exists yet but models already
+ * carry stale quota results (including stale "ok" ones from before the limit).
+ */
+function freeLaneLimited(state) {
+  return state.catalog.some(model => model.lane !== 'kilo' && state.results[model.id]?.state === 'limited')
+}
+
 export class ModelService {
   constructor({ store, config, logger, resolveImage }) {
     this.store = store
@@ -71,10 +111,13 @@ export class ModelService {
     this.disposed = false
     this.lastError = ''
     // The free lane's quota is accounted per egress IP; a burned exit answers
-    // every request with 429 and a Retry-After of hours. The breaker records
-    // that window once, from real traffic, and refuses locally until it ends.
-    this.quotaUntil = 0
-    this.quotaMessage = ''
+    // every request with 429 and a Retry-After of hours. The breaker persists
+    // across restarts from the store: a DSH reload must not zero the window and
+    // send the first request (often a harness compaction) straight into a wall
+    // the gateway already told us about.
+    const persisted = store.get()
+    this.quotaUntil = Number(persisted.quotaUntil) > 0 ? Number(persisted.quotaUntil) : 0
+    this.quotaMessage = typeof persisted.quotaMessage === 'string' ? persisted.quotaMessage : ''
     this.laneLockedMessage = ''
   }
 
@@ -121,6 +164,10 @@ export class ModelService {
             session: sessionForConversation('catalog:wb-free-model'),
           })
           const free = buildCatalog(parseListing(listing))
+          // The listing endpoint is NOT quota-limited: it answers 200 even
+          // while completions return 429. So a successful listing is NOT proof
+          // the egress recovered — do not clear the breaker here. Recovery is
+          // decided by an actual completion (see checkQuota).
           if (free.length > 0) catalog.push(...free)
           else errors.push('免费车道清单没有可用模型')
         } catch (error) {
@@ -191,11 +238,11 @@ export class ModelService {
     const excluded = excludedIds(state)
     return state.catalog
       .filter(model => !excluded.has(model.id))
-      .filter(model => !(state.results[model.id]?.source === 'probe' && state.results[model.id]?.ok === false))
+      .filter(model => !hidesModel(state.results[model.id]))
       .map(model => ({
         model,
         entry: {
-          provider: 'wbbridge',
+          provider: ROUTE,
           id: model.id,
           name: model.name,
           description: this.describe(model),
@@ -213,6 +260,8 @@ export class ModelService {
     const result = this.store.get().results[model.id]
     if (result?.ok === true && result?.chatOnly === true) return '仅对话（不支持工具调用）'
     if (result?.ok === true) return '可用'
+    // A lane-level probe result is a shared "wait" signal, not a failed model.
+    if (result?.ok === false && result?.state === 'limited') return `受限：${result.message ?? result.code ?? '未知原因'}`
     if (result?.ok === false && result?.source === 'probe') return `探测失败：${result.message ?? result.code ?? '未知原因'}`
     if (result?.ok === false) {
       // The state is display-only guidance: the model stays published and
@@ -228,7 +277,7 @@ export class ModelService {
     const catalog = await this.ensureCatalog()
     if (modelId === 'auto') {
       return {
-        provider: 'wbbridge',
+        provider: ROUTE,
         id: 'auto',
         name: 'WB · auto',
         description: '按耗时权重自动挑选当前可用的免费模型',
@@ -242,7 +291,7 @@ export class ModelService {
     const entry = catalog.find(model => model.id === modelId)
     if (entry === undefined) {
       return {
-        provider: 'wbbridge',
+        provider: ROUTE,
         id: modelId,
         name: modelId,
         context: { contextWindow: 131_072 },
@@ -251,7 +300,7 @@ export class ModelService {
     }
     const info = reasoningInfo(entry)
     return {
-      provider: 'wbbridge',
+      provider: ROUTE,
       id: entry.id,
       name: entry.name,
       description: this.describe(entry),
@@ -263,10 +312,22 @@ export class ModelService {
   }
 
   autoModelId({ messages, tools, effort }) {
+    return this.autoModelIdWithExclude({ messages, tools, effort })
+  }
+
+  autoModelIdWithExclude({ messages, tools, effort, exclude }) {
     const state = this.store.get()
     const excluded = excludedIds(state)
+    // While the free lane's egress is in a quota window, every OC model would
+    // answer 429 — including a harness context-compaction request. Route auto
+    // to the other lane (Kilo) so the turn can still complete. If the other
+    // lane has no candidate, fall through: selectModel's all-unhealthy
+    // fallback keeps `auto` usable rather than returning nothing.
+    const laneBlocked = !this.freeLaneAvailable() || freeLaneLimited(state)
     const usable = state.catalog.filter(model => !excluded.has(model.id)
-      && !(state.results[model.id]?.source === 'probe' && state.results[model.id]?.ok === false))
+      && !hidesModel(state.results[model.id])
+      && !(laneBlocked && model.lane !== 'kilo')
+      && !(exclude?.has(model.id) === true))
     const images = (messages ?? []).some(message => (message?.content ?? []).some(block => block?.type === 'image'))
     return selectModel({
       models: usable,
@@ -278,6 +339,34 @@ export class ModelService {
   }
 
   /**
+   * `auto` entry point: try the best candidate, and on a model/lane failure
+   * route to the next one — cached `ok:true` can be stale (an egress quota can
+   * be spent after a successful probe), so only a real attempt proves a model
+   * usable. Each attempt buffers its whole stream before returning, so a
+   * failure has emitted nothing to the harness and the retry is invisible.
+   * Tried ids are excluded so two candidates are never hit twice in one turn.
+   */
+  async autoComplete(params) {
+    const tried = new Set()
+    let last
+    for (let attempt = 0; attempt < AUTO_FAILOVER_LIMIT; attempt += 1) {
+      if (params.signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
+      const candidate = this.autoModelIdWithExclude({ ...params, exclude: tried })
+      if (candidate === undefined) break
+      tried.add(candidate)
+      try {
+        return await this.completeOnce({ ...params, modelId: candidate })
+      } catch (error) {
+        last = error
+        if (!failoverable(error)) throw error
+        this.logger?.warn?.(`dsh-wb-free-model: auto failover from ${candidate}: ${error?.message ?? error}`)
+      }
+    }
+    if (last !== undefined) throw last
+    throw new ModelError('没有可用的免费模型；请先刷新目录或运行探测', { code: 'MODEL_UNAVAILABLE' })
+  }
+
+  /**
    * One completion. Adapter and probe share this path.
    * `origin` says who initiated it: 'request' (default, adapter streams) gets
    * its outcome recorded; 'probe' skips recording entirely — the probe is the
@@ -286,7 +375,14 @@ export class ModelService {
    * once as the probe result, double-counting every streak).
    * Returns `{content, calls, chatOnly, usage, finish, modelId, elapsed}`.
    */
-  async complete({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs = REQUEST_TIMEOUT_MS, origin = 'request' }) {
+  async complete({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs = REQUEST_TIMEOUT_MS, origin = 'request', bypassQuota = false }) {
+    if (modelId === AUTO_MODEL_ID && origin !== 'probe') {
+      return this.autoComplete({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs, origin, bypassQuota })
+    }
+    return this.completeOnce({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs, origin, bypassQuota })
+  }
+
+  async completeOnce({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs = REQUEST_TIMEOUT_MS, origin = 'request', bypassQuota = false }) {
     if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
     try {
@@ -321,10 +417,15 @@ export class ModelService {
     if (hasImages && entry.images !== true) {
       throw new ModelError(`模型 ${entry.name} 不支持图片输入`, { code: 'INVALID_REQUEST', status: 400 })
     }
-    if (entry.lane !== 'kilo' && Date.now() < this.quotaUntil) {
+    // The breaker protects real traffic from hammering a spent egress. A probe
+    // is the one call that must be allowed through: it is how a retry learns
+    // the quota actually recovered (success clears the window) or re-reads the
+    // gateway's fresh Retry-After. Blocking it locally would deadlock — the
+    // window could only ever expire by wall-clock, never by evidence.
+    if (!bypassQuota && entry.lane !== 'kilo' && Date.now() < this.quotaUntil) {
       const minutes = Math.max(1, Math.round((this.quotaUntil - Date.now()) / 60_000))
       throw new ModelError(
-        `免费车道配额窗口中（约 ${minutes} 分钟后重试）：${this.quotaMessage || '上游按出口 IP 计免费配额，当前出口的窗口尚未结束'}`,
+        `OpenCode 匿名免费池当日配额已用尽（约 ${minutes} 分钟后于 UTC 日界自动重置）：${this.quotaMessage || 'Free usage limit reached'}。这是全球匿名请求共享的公共池，换网络出口或重启无效；请暂用 KL · 前缀模型，或配置自己的 OpenCode 凭据。`,
         { code: 'RATE_LIMIT', status: 429 },
       )
     }
@@ -454,10 +555,79 @@ export class ModelService {
    * (or the default one), and a client-gate refusal is recorded for the
    * settings page — waiting cannot clear that one.
    */
+  clearQuotaWindow() {
+    this.quotaUntil = 0
+    this.quotaMessage = ''
+    this.store.update({ quotaUntil: 0, quotaMessage: '' })
+  }
+
+  /** The free lane has quota right now (no local window, or it just cleared). */
+  freeLaneAvailable() {
+    return Date.now() >= this.quotaUntil
+  }
+
+  /**
+   * One shared, minimal completion that answers a single question: does the
+   * CURRENT egress still have free quota? This is the recovery path after a
+   * network change — the listing endpoint is not quota-limited (it answers 200
+   * even while completions get 429), so only a real completion can prove the
+   * exit recovered. Exactly one request is spent regardless of how many models
+   * are in the catalog; per-model probes never hammer the wall themselves.
+   *
+   * - success → noteFreeLaneOutcome(true) clears the window; callers then
+   *   re-probe normally, and stale `limited` marks are dropped first.
+   * - quota 429 → noteFreeLaneOutcome(false) re-arms the window from the fresh
+   *   upstream Retry-After, and false is returned so callers skip the lane.
+   * - any other error → returned as-is; it is not evidence about quota, so
+   *   callers leave the window as it was and let the real request/probe classify it.
+   */
+  async checkQuota({ signal } = {}) {
+    if (this.freeLaneAvailable()) return { ok: true, skipped: true }
+    const sample = this.store.get().catalog.find(model => model.lane !== 'kilo')
+    if (sample === undefined) return { ok: false, quota: false, message: '没有可用于配额探测的免费车道模型' }
+    try {
+      await this.complete({
+        modelId: sample.id,
+        messages: probeMessages('quota'),
+        tools: [],
+        signal,
+        timeoutMs: 30_000,
+        origin: 'probe',
+        bypassQuota: true,
+      })
+      // A success clears the window through noteFreeLaneOutcome(true). Drop the
+      // model-level "limited" marks that the spent window left behind so a
+      // recovered lane publishes clean "未探测 → 可用" results.
+      this.clearStaleLimited()
+      return { ok: true }
+    } catch (error) {
+      if (error?.code === CODE.quota) return { ok: false, quota: true, message: error.message }
+      return { ok: false, quota: false, code: error?.code, message: error?.message }
+    }
+  }
+
+  /**
+   * Remove probe results whose only evidence was a lane-level limit. Called
+   * after a successful quota check so those models return to "未探测" and are
+   * picked up by the next probe instead of staying tagged "受限" forever.
+   */
+  clearStaleLimited() {
+    const state = this.store.get()
+    let touched = false
+    for (const model of state.catalog) {
+      if (model.lane === 'kilo') continue
+      const result = state.results[model.id]
+      if (result?.ok === false && result?.state === 'limited' && result?.inconclusive === true) {
+        this.store.dropResult(model.id)
+        touched = true
+      }
+    }
+    if (touched) this.ensureCheckTimer()
+  }
+
   noteFreeLaneOutcome(ok, error) {
     if (ok === true) {
-      this.quotaUntil = 0
-      this.quotaMessage = ''
+      this.clearQuotaWindow()
       this.laneLockedMessage = ''
       return
     }
@@ -467,6 +637,7 @@ export class ModelService {
         ? Date.now() + retryAfter
         : Date.now() + LANE_QUOTA_DEFAULT_MS
       this.quotaMessage = String(error?.message ?? 'free usage limit reached').slice(0, 300)
+      this.store.update({ quotaUntil: this.quotaUntil, quotaMessage: this.quotaMessage })
       this.logger?.warn?.(`dsh-wb-free-model: free-lane quota window opens until ${new Date(this.quotaUntil).toISOString()}`)
       return
     }
@@ -528,9 +699,12 @@ export class ModelService {
       // (no checkedAt yet) immediately due instead of inheriting `at`.
       checkedAt: prior?.checkedAt ?? 0,
       chatOnly: prior?.chatOnly === true,
-      // Failure keeps the weight: one bad request must not erase what the
-      // model has proven. The state/streak carries the signal instead.
-      weight: prior?.weight,
+      // A rate limit / quota demotes the model until its next success or probe
+      // re-establishes the weight; any other failure keeps the weight, since
+      // one bad request must not erase what the model has otherwise proven.
+      weight: classification === 'limited'
+        ? limitedWeight(prior === undefined ? undefined : weightOf(undefined, prior))
+        : prior?.weight,
       ms,
       code,
       message,
@@ -562,6 +736,15 @@ export class ModelService {
     if (dueOnly === true) {
       const due = new Set(this.dueModels().map(model => model.id))
       queue = queue.filter(model => due.has(model.id))
+    }
+    // One shared quota decision for the whole batch. A spent egress must not
+    // make every free-lane model hammer the wall (and burn the quota window's
+    // Retry-After again): a single check either proves recovery — clearing the
+    // window and the stale 受限 marks — or skips the free lane this round while
+    // Kilo keeps probing on its own gateway.
+    if (queue.some(model => model.lane !== 'kilo') && !this.freeLaneAvailable()) {
+      const check = await this.checkQuota({ signal })
+      if (check.ok !== true && check.quota === true) queue = queue.filter(model => model.lane === 'kilo')
     }
     const total = queue.length
     let done = 0
@@ -614,6 +797,18 @@ export class ModelService {
     if (this.singleProbes >= limit) {
       throw new ModelError('单模型检测并发已满，请稍后再试', { code: 'PROBE_BUSY', status: 409 })
     }
+    // Single retry is the other recovery entry point: one shared quota check
+    // decides whether a network change already restored the egress. If the
+    // exit is still spent, fail fast with the real gateway reason instead of
+    // writing another per-model "受限" record or hitting the wall again.
+    if (model.lane !== 'kilo' && !this.freeLaneAvailable()) {
+      const check = await this.checkQuota({ signal })
+      if (check.ok !== true && check.quota === true) {
+        throw new ModelError(check.message ?? '免费车道出口配额仍未恢复', {
+          code: 'RATE_LIMIT', status: 429,
+        })
+      }
+    }
     this.inflight += 1
     this.singleProbes += 1
     const controller = new AbortController()
@@ -655,6 +850,7 @@ export class ModelService {
           timeoutMs: 60_000,
           // The probe owns its evidence: complete() must not also record the
           // probe's request as a request outcome (double streaks, wrong weight).
+          // Quota is decided once per batch by checkQuota, not per model here.
           origin: 'probe',
         }),
       })
@@ -665,6 +861,37 @@ export class ModelService {
     // instead of persisting a CONFIG_DISABLED "probe failure" that would hide
     // the model from the selector until a manual retry.
     if (!this.enabled || this.disposed || result?.code === 'CONFIG_DISABLED') return result
+    const classification = classifyFailure({ code: result.code, message: result.message, status: result.status })
+    // A spent free-tier quota (429) or a transport/protocol break is evidence
+    // about the shared lane, not about this model. Record it as `limited` —
+    // the same state a failed real request writes — so the retry has a visible
+    // outcome and the selector agrees with the chat experience. `limited`
+    // results never hide the model (see hidesModel), never consume a failure
+    // streak/recycle count, and keep the prior weight and chat-only mark.
+    if (result.ok === false && (result.code === CODE.quota || classification === null)) {
+      const reason = String(result.message ?? result.code ?? '车道级失败')
+      this.lastError = reason
+      this.logger?.warn?.(`dsh-wb-free-model: probe of ${model.id} inconclusive (${result.code}); marked limited`)
+      this.store.setResult(model.id, {
+        ...prior,
+        ok: false,
+        state: 'limited',
+        inconclusive: true,
+        failStreak: prior?.failStreak ?? 0,
+        checkFails: prior?.checkFails ?? 0,
+        checkedAt: prior?.checkedAt ?? 0,
+        probedAt: Date.now(),
+        weight: prior?.weight,
+        chatOnly: prior?.chatOnly === true,
+        code: result.code,
+        message: reason,
+        status: result.status,
+        ms: result.ms,
+        source: 'probe',
+        trigger,
+      })
+      return result
+    }
     if (result.ok === true) {
       this.store.setResult(model.id, {
         ...prior,
@@ -673,6 +900,7 @@ export class ModelService {
         failStreak: 0,
         checkFails: 0,
         checkedAt: Date.now(),
+        probedAt: Date.now(),
         weight: probeWeight(result.ms),
         chatOnly: result.chatOnly === true || prior?.chatOnly === true,
         note: result.note,
@@ -687,7 +915,6 @@ export class ModelService {
       this.ensureCheckTimer()
       return result
     }
-    const classification = classifyFailure({ code: result.code, message: result.message, status: result.status })
     const scheduled = trigger === 'scheduled'
     this.store.setResult(model.id, {
       ...prior,
@@ -703,6 +930,7 @@ export class ModelService {
       // it from `at` (which this very write overwrites): a never-checked
       // model's manual failure would otherwise look "checked" for 24h.
       checkedAt: scheduled ? Date.now() : prior?.checkedAt ?? 0,
+      probedAt: Date.now(),
       weight: 0,
       chatOnly: prior?.chatOnly === true,
       note: result.note,
@@ -745,7 +973,9 @@ export class ModelService {
       // "No result entry at all" is due immediately — freshly discovered
       // models never wait a full interval for their first check.
       if (result === undefined) return true
-      return now - checkedAtOf(result, now) >= CHECK_INTERVAL_MS
+      // Low-weight models anchor on their last probe, not on routine usage,
+      // so a demoted model is still rechecked every 24h (see checkAnchorOf).
+      return now - checkAnchorOf(result, now) >= CHECK_INTERVAL_MS
     })
   }
 
@@ -782,7 +1012,7 @@ export class ModelService {
       const excluded = excludedIds(state)
       const times = state.catalog
         .filter(model => !excluded.has(model.id))
-        .map(model => checkedAtOf(state.results[model.id], now))
+        .map(model => checkAnchorOf(state.results[model.id], now))
       if (times.length === 0) {
         this.clearCheckTimer()
         return
@@ -863,9 +1093,11 @@ export class ModelService {
             state: stateOf(result),
             failStreak: result?.failStreak ?? 0,
             checkFails: result?.checkFails ?? 0,
-            lastCheckAt: checkedAtOf(result, now),
+            // Low-weight models show the probe-based anchor, matching when
+            // the 24h recheck actually fires (see checkAnchorOf / dueModels).
+            lastCheckAt: checkAnchorOf(result, now),
             // 0 = no health evidence at all → "待检测" (due immediately).
-            nextCheckAt: checkedAtOf(result, now) > 0 ? checkedAtOf(result, now) + CHECK_INTERVAL_MS : 0,
+            nextCheckAt: checkAnchorOf(result, now) > 0 ? checkAnchorOf(result, now) + CHECK_INTERVAL_MS : 0,
             result,
             weight: weightOf(model, result),
           }))

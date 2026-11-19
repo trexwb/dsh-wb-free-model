@@ -102,11 +102,14 @@ export function renderStatus(snapshot, detail) {
     // to be split on both fields or one model counts twice.
     const usable = snapshot.models.filter(model => model.result?.ok === true && model.result?.chatOnly !== true)
     const chatOnly = snapshot.models.filter(model => model.result?.ok === true && model.result?.chatOnly === true)
-    const failed = snapshot.models.filter(model => model.result?.ok === false)
+    const limited = snapshot.models.filter(model => model.result?.ok === false && model.result?.state === 'limited')
+    const failed = snapshot.models.filter(model => model.result?.ok === false && model.result?.state !== 'limited')
     const unprobed = snapshot.models.filter(model => model.result === undefined)
-    lines.push(`可调用工具 ${usable.length} / 仅对话 ${chatOnly.length} / 失败 ${failed.length} / 未检测 ${unprobed.length}`)
+    lines.push(`可调用工具 ${usable.length} / 仅对话 ${chatOnly.length} / 受限 ${limited.length} / 失败 ${failed.length} / 未检测 ${unprobed.length}`)
     for (const model of snapshot.models) {
-      const mark = model.result === undefined ? '未检测' : model.result.ok !== true ? '失败' : model.result.chatOnly === true ? '仅对话' : '可用'
+      const mark = model.result === undefined ? '未检测'
+        : model.result.ok === true ? (model.result.chatOnly === true ? '仅对话' : '可用')
+          : model.result.state === 'limited' ? '受限' : '失败'
       const reason = model.result?.ok === false ? `：${model.result.message ?? model.result.code ?? '未知原因'}` : ''
       // `state` is the health state machine (ok / limited / down, absent without
       // evidence); it explains a low weight even where the last probe passed.

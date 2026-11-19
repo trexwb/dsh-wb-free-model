@@ -51,11 +51,19 @@ export function createActions({ service, store, logger, broadcast, surfaces, set
     // far beyond a client's patience, and the connection must not decide
     // whether the refresh finishes. Failures land in snapshot.lastError.
     void service.refreshCatalog()
-      .then(() => {
-        // A refresh can swap models in: re-derive the arm point, then optionally
-        // run a manual probe batch over the fresh catalog.
+      .then(async () => {
+        // A refresh can swap models in: re-derive the arm point immediately.
         service.ensureCheckTimer()
-        if (probe === true) return service.startProbes({ concurrency, trigger: 'manual' })
+        // The listing endpoint is not quota-limited, so only a real completion
+        // can prove the shared anonymous pool has reset (UTC midnight). Spend
+        // exactly one when the local window says it might still be active.
+        // Success clears the window and stale 受限 marks; a fresh 429 keeps it.
+        let recovered = false
+        if (!service.freeLaneAvailable()) {
+          const check = await service.checkQuota()
+          recovered = check.ok === true
+        }
+        if (probe === true || recovered) return service.startProbes({ concurrency, trigger: 'manual' })
         return undefined
       })
       .catch(() => {})

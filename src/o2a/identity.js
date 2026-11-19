@@ -56,3 +56,26 @@ export function randomID(prefix, size) {
 export function randomProjectID() {
   return randomBytes(20).toString('hex')
 }
+
+// Crockford base32, the alphabet ULIDs use. The real client stamps every
+// assistant turn with `x-opencode-request: msg_<ulid>` (26 chars: 10 for the
+// 48-bit millisecond timestamp, 16 for randomness); the gateway's request
+// accounting keys on it, so each turn carries a fresh, time-ordered id.
+const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+
+export function ulid(now = Date.now(), entropy = randomBytes(10)) {
+  const time = BigInt(Math.max(0, Math.floor(now))) & 0xffffffffffffn
+  let tail = 0n
+  for (const byte of entropy) tail = (tail << 8n) | BigInt(byte)
+  // 10 time chars (48-bit timestamp, 5 bits each) then 16 entropy chars
+  // (80 bits), most significant first — the canonical ULID layout.
+  let id = ''
+  let t = time
+  for (let i = 0; i < 10; i += 1) { id = CROCKFORD[Number(t & 31n)] + id; t >>= 5n }
+  for (let i = 0; i < 16; i += 1) { id = CROCKFORD[Number(tail & 31n)] + id; tail >>= 5n }
+  return id
+}
+
+export function messageRequestID(now = Date.now()) {
+  return `msg_${ulid(now)}`
+}

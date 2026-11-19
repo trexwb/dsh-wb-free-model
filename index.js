@@ -20,21 +20,25 @@
 import fs from 'node:fs'
 import { ROUTE, ROUTE_LABEL, AUTO_MODEL_ID, AUTO_MODEL_NAME } from './src/constants.js'
 import { WbFreeModelAdapter } from './src/adapter.js'
-import { ModelService, ModelError } from './src/service.js'
+import { ModelService } from './src/service.js'
 import { Store, resolveDataDir } from './src/store.js'
 import { createActions } from './src/actions.js'
-import { SETTINGS_NS, installNativeSurface } from './src/native.js'
 
 export const name = 'dsh-wb-free-model'
 export const inject = ['llm']
 export { ROUTE, ROUTE_LABEL, AUTO_MODEL_ID, AUTO_MODEL_NAME }
 
-const API_PREFIX = '/api/wb-free-model'
+// Keep this in sync with src/native.js. It lives here as a plain string so the
+// host half never has to statically import native.js: that module imports
+// `@deepseek-ai/schemastery`, a peer the host normally supplies, but a
+// symlink-installed plugin resolves peers from its real path (the workspace),
+// where the package is absent. A static import there would fail the whole
+// module graph — including this entry and the settings API — before apply()
+// ever runs. The native surfaces are optional, so they load asynchronously
+// and degrade alone (see apply()'s tail).
+const SETTINGS_NS = 'dsh-wb-free-model'
 
-function isLoopback(req) {
-  const address = req.socket?.remoteAddress ?? ''
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
-}
+const API_PREFIX = '/api/wb-free-model'
 
 /**
  * DSH image blocks carry only an attachment id; this turns one into a data URL
@@ -72,30 +76,11 @@ function imageResolver(ctx, logger) {
   }
 }
 
-function sendJSON(res, status, payload) {
-  const body = JSON.stringify(payload)
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body),
-  })
-  res.end(body)
-}
-
-async function readJSON(req, limit = 64 * 1024) {
-  const chunks = []
-  let size = 0
-  for await (const chunk of req) {
-    size += chunk.length
-    if (size > limit) throw new ModelError('request body too large', { code: 'INVALID_REQUEST', status: 413 })
-    chunks.push(chunk)
-  }
-  if (chunks.length === 0) return {}
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
-  } catch {
-    throw new ModelError('request body is not valid JSON', { code: 'INVALID_REQUEST', status: 400 })
-  }
+// DSH's connection layer expects each HTTP route's `fetch(request)` to return
+// a standard Response (the same contract the host's own plugins use). JSON
+// answers all go through here so status/errors keep one shape.
+function jsonResponse(status, payload) {
+  return Response.json(payload, { status, headers: { 'cache-control': 'no-store' } })
 }
 
 export function apply(ctx, config = {}) {
@@ -180,36 +165,51 @@ export function apply(ctx, config = {}) {
   })
 
   // ── browser-facing settings API ──────────────────────────────────────────────
-  ctx.inject(['webServer'], scoped => {
-    const server = scoped.webServer
-    const handler = async (req, res) => {
+  // DSH serves plugin HTTP routes through the connection layer's `fetch`
+  // registry, NOT through a `webServer.register({ kind: 'prefix' })` handler —
+  // that older contract silently mounts nothing on the current host, which is
+  // why /status kept answering 404 "not found". Each route follows the same
+  // shape the host's own plugins use:
+  //   { path, methods, requestBody, fetch(request) -> Response }
+  // Owner authentication (loopback / session) is enforced by the connection
+  // layer before our `fetch` runs, so no local isLoopback check is needed here.
+  ctx.inject(['connection'], scoped => {
+    const fetchRoutes = scoped.connection?.fetch
+    if (typeof fetchRoutes?.register !== 'function') {
+      logger.warn?.('dsh-wb-free-model: connection.fetch registry unavailable; the web settings API will not mount')
+      return
+    }
+
+    const handle = async (request, action) => {
       try {
-        if (!isLoopback(req)) return sendJSON(res, 403, { error: 'loopback only' })
-        const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-        const route = url.pathname.startsWith(API_PREFIX) ? url.pathname.slice(API_PREFIX.length) || '/' : url.pathname
-        if (req.method === 'GET' && route === '/status') {
-          return sendJSON(res, 200, service.snapshot())
-        }
-        if (req.method !== 'POST') return sendJSON(res, 405, { error: 'method not allowed' })
-        if (!String(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) {
-          return sendJSON(res, 415, { error: 'application/json required' })
-        }
-        const body = await readJSON(req)
-        const action = route.slice(1)
-        if (!ACTION_ROUTES.has(action)) return sendJSON(res, 404, { error: 'not found' })
+        if (action === 'status') return jsonResponse(200, service.snapshot())
+        if (typeof request.json !== 'function') return jsonResponse(415, { error: 'application/json required' })
+        const body = await request.json().catch(() => ({}))
         // Refresh and probe start in the background and answer 202; clients
         // poll /status, because an open connection must not decide whether the
         // work finishes.
         const { status, payload } = await actions.run(action, body)
-        return sendJSON(res, status, payload)
+        return jsonResponse(status, payload)
       } catch (error) {
-        logger.warn?.(`dsh-wb-free-model: API ${req.method} ${req.url} failed: ${error?.message ?? error}`)
-        sendJSON(res, error?.status ?? 500, { error: error?.message ?? String(error), code: error?.code ?? 'SERVER' })
+        logger.warn?.(`dsh-wb-free-model: API ${action} failed: ${error?.message ?? error}`)
+        return jsonResponse(error?.status ?? 500, { error: error?.message ?? String(error), code: error?.code ?? 'SERVER' })
       }
     }
-    scoped.effect(() => server.register({ kind: 'prefix', path: API_PREFIX, handler }), 'dsh-wb-free-model: settings API')
+
+    const routes = [
+      { path: `${API_PREFIX}/status`, methods: ['GET'], requestBody: 'buffered', fetch: request => handle(request, 'status') },
+      ...[...ACTION_ROUTES].map(action => ({
+        path: `${API_PREFIX}/${action}`,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: request => handle(request, action),
+      })),
+    ]
+    for (const route of routes) {
+      scoped.effect(() => fetchRoutes.register(route), `dsh-wb-free-model: ${route.path}`)
+    }
     surfaces.api = true
-    logger.info?.(`dsh-wb-free-model: settings API mounted at ${API_PREFIX}`)
+    logger.info?.(`dsh-wb-free-model: settings API mounted at ${API_PREFIX} via connection.fetch (${routes.length} routes)`)
   })
 
   // ── lifecycle ────────────────────────────────────────────────────────────────
@@ -307,5 +307,20 @@ export function apply(ctx, config = {}) {
   // native form, tools it can call in chat, and `/wb-free` in the composer. All
   // three drive `src/actions.js`, the same rules the routes above use, and the
   // settings namespace owns the preference write.
-  setPreferences = installNativeSurface(ctx, { store, config, logger, actions, surfaces, toggleLane }).setPreferences
+  //
+  // Loaded dynamically on purpose: native.js needs the schemastery peer, which
+  // a symlink install resolves from the wrong node_modules. These surfaces are
+  // optional (the web API and the model lane are already live above), so a
+  // missing peer must cost only them — never the whole plugin and its /status
+  // route. Keep setPreferences callable even before the async load finishes.
+  setPreferences = patch => {
+    store.update(patch)
+    return store.flush()
+  }
+  void import('./src/native.js').then(module => {
+    if (disposed) return
+    setPreferences = module.installNativeSurface(ctx, { store, config, logger, actions, surfaces, toggleLane }).setPreferences
+  }).catch(error => {
+    logger.warn?.(`dsh-wb-free-model: native surfaces unavailable (${error?.message ?? error}); the lane and the web API remain active`)
+  })
 }

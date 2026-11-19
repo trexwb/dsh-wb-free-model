@@ -1,5 +1,5 @@
 /**
- * Provider adapter for the `wbbridge` route.
+ * Provider adapter for the `dshfreemodels` route.
  *
  * Written structurally (no base-class import) so it mounts on the DSH kernel
  * line the user has installed, regardless of its exact dsh-llm version. The
