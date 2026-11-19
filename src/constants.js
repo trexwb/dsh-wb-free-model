@@ -53,3 +53,12 @@ export const LANE_QUOTA_DEFAULT_MS = 6 * 60 * 60 * 1000
 export const PROBE_WEIGHT_SLOW_MS = 30_000
 export const PROBE_WEIGHT_PENALTY = 20
 export const DEFAULT_WEIGHT = 100
+
+/** Automatic health re-check budget per model. */
+export const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+/** Due models picked up per armed check (the "2 per 15 minutes" trickle). */
+export const CHECK_BATCH = 2
+/** How soon after arming the first due models get checked. */
+export const CHECK_SPREAD_MS = 15 * 60 * 1000
+/** Consecutive scheduled-check failures before a model lands in the recycle bin suggestions. */
+export const RECYCLE_THRESHOLD = 3

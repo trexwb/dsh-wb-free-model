@@ -11,13 +11,17 @@
  * the ones their models emit as JSON, which the adapter hands to the harness.
  */
 
-import { selectModel, allWeightsExhausted, nextWeight, weightOf, autoLevels } from './auto.js'
+import { autoLevels, checkedAtOf, classifyFailure, nextWeight, probeWeight, selectModel, stateOf, weightOf } from './auto.js'
 import { buildCatalog, buildKiloCatalog, parseListing } from './catalog.js'
 import {
+  CHECK_BATCH,
+  CHECK_INTERVAL_MS,
+  CHECK_SPREAD_MS,
   DEFAULT_MAX_TOKENS,
   FALLBACK_MAX_TOKENS,
   LANE_QUOTA_DEFAULT_MS,
   LISTING_TIMEOUT_MS,
+  RECYCLE_THRESHOLD,
   REQUEST_TIMEOUT_MS,
   UPSTREAM_LISTING_PATH,
 } from './constants.js'
@@ -25,6 +29,7 @@ import { CODE, getJson, postStreamed, UpstreamError } from './http.js'
 import { fetchKiloListing, postKiloStreamed } from './kilo.js'
 import { probeModel, PROBE_TOOLS, probeMessages } from './probe.js'
 import { acceptsEffort, effortPatchFor, reasoningInfo } from './reasoning.js'
+import { excludedIds } from './store.js'
 import { applyFingerprint, endpointFor, sessionForConversation } from './upstream.js'
 import { feedChat, finishReason as finishReasonOf, repairToolPairing, StreamFold, toChatMessages, toToolDefs } from './wire.js'
 
@@ -59,6 +64,10 @@ export class ModelService {
     this.probingIds = new Set()
     this.probeControllers = new Set()
     this.singleProbes = 0
+    // 24h maintenance cadence: one armed timer, `checkAt` is the target arm
+    // point (kept separately so busy-time deferrals are explicit).
+    this.checkTimer = undefined
+    this.checkAt = undefined
     this.disposed = false
     this.lastError = ''
     // The free lane's quota is accounted per egress IP; a burned exit answers
@@ -139,6 +148,11 @@ export class ModelService {
         }
         this.store.setCatalog(merged)
         await this.store.flush()
+        // A refresh can swap brand-new models in (the hourly stale-refresh on
+        // the adapter path and every complete() do this silently): re-arm so a
+        // fresh model is due immediately and picked up within the spread
+        // window instead of waiting for the previous arm point (~24h worst case).
+        this.ensureCheckTimer()
         this.lastError = ''
         this.logger?.info?.(`dsh-wb-free-model: discovered ${merged.length} free models`)
         return merged
@@ -153,8 +167,9 @@ export class ModelService {
     return this.refreshing
   }
 
-  /** Stop-the-lane side effects: abort probes. There is no child to reap. */
+  /** Stop-the-lane side effects: disarm the cadence, abort in-flight probes. */
   async deactivate() {
+    this.clearCheckTimer()
     for (const controller of this.probeControllers) {
       try { controller.abort(new Error('WB Free Model 已关闭')) } catch { /* ignore */ }
     }
@@ -173,17 +188,25 @@ export class ModelService {
 
   listModels() {
     const state = this.store.get()
-    const disabled = new Set(state.disabled)
+    const excluded = excludedIds(state)
     return state.catalog
-      .filter(model => !disabled.has(model.id))
+      .filter(model => !excluded.has(model.id))
       .filter(model => !(state.results[model.id]?.source === 'probe' && state.results[model.id]?.ok === false))
       .map(model => ({
-        provider: 'wbbridge',
-        id: model.id,
-        name: model.name,
-        description: this.describe(model),
-        inputModalities: model.images === true ? ['text', 'image'] : ['text'],
+        model,
+        entry: {
+          provider: 'wbbridge',
+          id: model.id,
+          name: model.name,
+          description: this.describe(model),
+          inputModalities: model.images === true ? ['text', 'image'] : ['text'],
+        },
       }))
+      // Publication order mirrors the auto pick: weight descending, ties keep
+      // catalog order (Array#sort is stable since ES2019).
+      .sort((left, right) =>
+        weightOf(right.model, state.results[right.model.id]) - weightOf(left.model, state.results[left.model.id]))
+      .map(item => item.entry)
   }
 
   describe(model) {
@@ -191,7 +214,13 @@ export class ModelService {
     if (result?.ok === true && result?.chatOnly === true) return '仅对话（不支持工具调用）'
     if (result?.ok === true) return '可用'
     if (result?.ok === false && result?.source === 'probe') return `探测失败：${result.message ?? result.code ?? '未知原因'}`
-    if (result?.ok === false) return '最近一次请求失败，仍可重试'
+    if (result?.ok === false) {
+      // The state is display-only guidance: the model stays published and
+      // selectable — one failure is not proof the model is gone.
+      if (result?.state === 'limited') return '最近请求被限流，稍后自动恢复'
+      if (result?.state === 'down') return '最近请求失败，模型可能暂不可用'
+      return '最近一次请求失败，仍可重试'
+    }
     return '尚未探测'
   }
 
@@ -235,8 +264,8 @@ export class ModelService {
 
   autoModelId({ messages, tools, effort }) {
     const state = this.store.get()
-    const disabled = new Set(state.disabled)
-    const usable = state.catalog.filter(model => !disabled.has(model.id)
+    const excluded = excludedIds(state)
+    const usable = state.catalog.filter(model => !excluded.has(model.id)
       && !(state.results[model.id]?.source === 'probe' && state.results[model.id]?.ok === false))
     const images = (messages ?? []).some(message => (message?.content ?? []).some(block => block?.type === 'image'))
     return selectModel({
@@ -250,9 +279,14 @@ export class ModelService {
 
   /**
    * One completion. Adapter and probe share this path.
+   * `origin` says who initiated it: 'request' (default, adapter streams) gets
+   * its outcome recorded; 'probe' skips recording entirely — the probe is the
+   * sole owner of its evidence and writes the record itself (otherwise one
+   * probe failure would be written twice: once as a fake request failure here,
+   * once as the probe result, double-counting every streak).
    * Returns `{content, calls, chatOnly, usage, finish, modelId, elapsed}`.
    */
-  async complete({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs = REQUEST_TIMEOUT_MS }) {
+  async complete({ modelId, messages, system, tools, effort, signal, sessionId, timeoutMs = REQUEST_TIMEOUT_MS, origin = 'request' }) {
     if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     if (signal?.aborted === true) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
     try {
@@ -346,13 +380,15 @@ export class ModelService {
       if (error instanceof UpstreamError) {
         if (entry.lane !== 'kilo') this.noteFreeLaneOutcome(false, error)
         const aborted = error.code === CODE.aborted || signal?.aborted === true
-        if (!aborted && this.enabled && !this.disposed) {
+        // A probe-initiated completion is not request evidence at all.
+        if (origin !== 'probe' && !aborted && this.enabled && !this.disposed) {
           this.recordOutcome(entry.id, {
             ok: false,
             ms: Date.now() - started,
             source: 'request',
             code: error.code,
             message: error.message,
+            status: error.status,
           })
         }
         if (aborted) throw new ModelError('request aborted', { code: 'ABORTED', status: 499 })
@@ -398,7 +434,9 @@ export class ModelService {
     }
 
     const elapsed = Date.now() - started
-    this.recordOutcome(entry.id, { ok: true, ms: elapsed, source: 'request' })
+    if (origin !== 'probe') {
+      this.recordOutcome(entry.id, { ok: true, ms: elapsed, source: 'request' })
+    }
     return {
       content,
       calls,
@@ -437,35 +475,94 @@ export class ModelService {
     }
   }
 
-  recordOutcome(modelId, { ok, ms, source, code, message }) {
-    const state = this.store.get()
-    const prior = state.results[modelId]
-    const weight = nextWeight(prior === undefined ? undefined : weightOf(undefined, prior), ok, source, ms)
+  /**
+   * Write one request outcome as the model's new result record. setResult is
+   * a whole-record replacement, so every branch spreads the prior record and
+   * overrides only the keys it owns — dropping weight/chatOnly/checkedAt here
+   * would silently reset the model's published state (weight to the default,
+   * an immediate "due", a lost chat-only mark).
+   */
+  recordOutcome(modelId, { ok, ms, source, code, message, status }) {
+    const prior = this.store.get().results[modelId]
+    if (ok === true) {
+      this.store.setResult(modelId, {
+        ...prior,
+        ok: true,
+        state: 'ok',
+        failStreak: 0,
+        checkFails: 0,
+        // A success is valid health evidence: it advances the 24h schedule
+        // (the model's weight refreshes from today's usage statistics).
+        checkedAt: Date.now(),
+        // Only a probe may declare a model chat-only; a request without tools
+        // is not evidence about the model's function-calling ability.
+        chatOnly: prior?.chatOnly === true,
+        weight: nextWeight(prior === undefined ? undefined : weightOf(undefined, prior), true, source, ms),
+        ms,
+        code,
+        message,
+        // Requests carry no probe trigger — drop whatever an earlier probe wrote.
+        trigger: undefined,
+        source,
+        status,
+      })
+      // The success advances checkedAt and can empty the due set: recompute.
+      this.ensureCheckTimer()
+      return
+    }
+    // A real request failure is evidence about the model, but only as much as
+    // the classification says: null-classified failures (the lane or this
+    // machine's transport failing below the models) only flip the displayed
+    // failure — they count neither the streak nor a state.
+    const classification = classifyFailure({ code, message, status })
     this.store.setResult(modelId, {
-      ok,
-      // Only a probe may declare a model chat-only; a request without tools is
-      // not evidence about the model's function-calling ability.
+      ...prior,
+      ok: false,
+      state: classification ?? prior?.state,
+      failStreak: classification !== null ? (prior?.failStreak ?? 0) + 1 : prior?.failStreak ?? 0,
+      // Request failures never feed the recycle counter (scheduled probes only).
+      checkFails: prior?.checkFails ?? 0,
+      // Keep the last real health-evidence time: a request failure must not
+      // manufacture one, or the 24h cadence would silently skip the model
+      // ("checked" without a check). checkedAt ?? 0 also keeps legacy records
+      // (no checkedAt yet) immediately due instead of inheriting `at`.
+      checkedAt: prior?.checkedAt ?? 0,
       chatOnly: prior?.chatOnly === true,
-      weight,
+      // Failure keeps the weight: one bad request must not erase what the
+      // model has proven. The state/streak carries the signal instead.
+      weight: prior?.weight,
       ms,
       code,
       message,
+      trigger: undefined,
       source,
+      status,
     })
-    if (ok && source === 'request' && allWeightsExhausted(this.store.get().catalog, this.store.get().results)) {
-      this.startProbes().catch(() => {})
-    }
   }
 
-  /** Sequential probe queue with `concurrency` workers. */
-  async startProbes({ signal, concurrency = this.config.probeConcurrency ?? 2 } = {}) {
+  /**
+   * Probe queue with `concurrency` workers. `trigger` labels who started the
+   * batch ('scheduled' failures feed the streak counters; 'manual' ones do
+   * not), `models` restricts the batch to those ids, `dueOnly` keeps only
+   * currently-due models. Recycled/disabled models never enter the queue and
+   * are re-checked when a worker takes the head (a mid-batch /recycle must
+   * not keep probing its model this round).
+   */
+  async startProbes({ signal, concurrency = this.config.probeConcurrency ?? 2, trigger = 'manual', dueOnly = false, models } = {}) {
     if (this.probing) return { started: false }
     if (!this.enabled) return { started: false, reason: 'disabled' }
     this.probing = true
     const controller = new AbortController()
     this.probeControllers.add(controller)
     const startedAt = Date.now()
-    const queue = this.store.get().catalog.filter(model => !this.store.get().disabled.includes(model.id))
+    const state = this.store.get()
+    const excluded = excludedIds(state)
+    let queue = state.catalog.filter(model => !excluded.has(model.id)
+      && (models === undefined || models.includes(model.id)))
+    if (dueOnly === true) {
+      const due = new Set(this.dueModels().map(model => model.id))
+      queue = queue.filter(model => due.has(model.id))
+    }
     const total = queue.length
     let done = 0
     const worker = async () => {
@@ -474,10 +571,10 @@ export class ModelService {
       // CONFIG_DISABLED failures.
       while (queue.length > 0 && !this.disposed && this.enabled && !controller.signal.aborted) {
         const model = queue.shift()
-        if (this.probingIds.has(model.id)) { done += 1; continue }
+        if (excludedIds(this.store.get()).has(model.id) || this.probingIds.has(model.id)) { done += 1; continue }
         this.probingIds.add(model.id)
         try {
-          await this.runProbe(model, signal ?? controller.signal)
+          await this.runProbe(model, signal ?? controller.signal, { trigger })
         } finally {
           this.probingIds.delete(model.id)
         }
@@ -501,6 +598,15 @@ export class ModelService {
     if (!this.enabled) throw new ModelError('WB Free Model 已在设置里关闭', { code: 'CONFIG_DISABLED', status: 409 })
     const model = this.resolveEntry(modelId)
     if (model === undefined) throw new ModelError(`未知模型 "${modelId}"`, { code: 'MODEL_NOT_FOUND', status: 404 })
+    const excluded = excludedIds(this.store.get())
+    if (excluded.has(model.id)) {
+      throw new ModelError(
+        this.store.get().recycled.includes(model.id)
+          ? '该模型已移入回收站，请先恢复再检测'
+          : '该模型已被禁用，无法检测',
+        { code: this.store.get().recycled.includes(model.id) ? 'RECYCLED' : 'DISABLED', status: 409 },
+      )
+    }
     if (this.probingIds.has(model.id)) {
       throw new ModelError('该模型正在检测中，请等当前检测完成', { code: 'PROBE_IN_PROGRESS', status: 409 })
     }
@@ -524,8 +630,13 @@ export class ModelService {
     }
   }
 
-  async runProbe(model, signal) {
+  async runProbe(model, signal, { trigger = 'manual' } = {}) {
     if (!this.enabled || this.disposed) return undefined
+    // Snapshot the prior record before probing: the probe's own completion
+    // travels through complete(), and the streaks/checked time must be
+    // computed from the pre-probe state, never from whatever an intermediate
+    // write left behind.
+    const prior = this.store.get().results[model.id]
     let result
     try {
       result = await probeModel({
@@ -535,9 +646,16 @@ export class ModelService {
           messages: probeMessages(token),
           // A catalog that already declares no tool support gets the plain-chat
           // probe, so it publishes as chat-only instead of failing the request.
-          tools: chatOnly || model.toolcall !== true ? [] : PROBE_TOOLS,
+          // A model already PUBLISHED as chat-only is re-probed the same way:
+          // sending it tools would trip complete()'s own capability gate (400
+          // before the model is ever contacted), turning every daily re-probe
+          // into a manufactured failure that hides a working chat model.
+          tools: chatOnly || model.toolcall !== true || prior?.chatOnly === true ? [] : PROBE_TOOLS,
           signal: probeSignal,
           timeoutMs: 60_000,
+          // The probe owns its evidence: complete() must not also record the
+          // probe's request as a request outcome (double streaks, wrong weight).
+          origin: 'probe',
         }),
       })
     } catch (error) {
@@ -547,24 +665,212 @@ export class ModelService {
     // instead of persisting a CONFIG_DISABLED "probe failure" that would hide
     // the model from the selector until a manual retry.
     if (!this.enabled || this.disposed || result?.code === 'CONFIG_DISABLED') return result
+    if (result.ok === true) {
+      this.store.setResult(model.id, {
+        ...prior,
+        ok: true,
+        state: 'ok',
+        failStreak: 0,
+        checkFails: 0,
+        checkedAt: Date.now(),
+        weight: probeWeight(result.ms),
+        chatOnly: result.chatOnly === true || prior?.chatOnly === true,
+        note: result.note,
+        code: result.code,
+        message: result.message,
+        status: result.status,
+        ms: result.ms,
+        source: 'probe',
+        trigger,
+      })
+      // The success can empty the due set: recompute the arm point.
+      this.ensureCheckTimer()
+      return result
+    }
+    const classification = classifyFailure({ code: result.code, message: result.message, status: result.status })
+    const scheduled = trigger === 'scheduled'
     this.store.setResult(model.id, {
-      ...result,
-      weight: result.ok === true ? nextWeight(undefined, true, 'probe', result.ms) : 0,
+      ...prior,
+      ok: false,
+      state: classification ?? prior?.state,
+      // Only scheduled probes feed the streaks: a manual probe is the user's
+      // own action, not a cadence failure, and must not fast-track the
+      // hysteresis filter or the recycle counter.
+      failStreak: scheduled ? (prior?.failStreak ?? 0) + 1 : prior?.failStreak ?? 0,
+      checkFails: scheduled ? (prior?.checkFails ?? 0) + 1 : prior?.checkFails ?? 0,
+      // A scheduled probe just produced (negative) evidence: that was a check.
+      // A manual one is not — never advance the checked time, and never derive
+      // it from `at` (which this very write overwrites): a never-checked
+      // model's manual failure would otherwise look "checked" for 24h.
+      checkedAt: scheduled ? Date.now() : prior?.checkedAt ?? 0,
+      weight: 0,
+      chatOnly: prior?.chatOnly === true,
+      note: result.note,
+      code: result.code,
+      message: result.message,
+      status: result.status,
+      ms: result.ms,
       source: 'probe',
+      trigger,
     })
+    // Scheduled failures leave the due set (checkedAt=now); manual ones keep
+    // it (an already-due model gets its trickle re-check). Recompute anyway:
+    // idempotent when the set did not change.
+    this.ensureCheckTimer()
     return result
   }
 
   dispose() {
     this.disposed = true
+    this.clearCheckTimer()
     for (const controller of this.probeControllers) {
       try { controller.abort(new Error('WB Free Model 插件已卸载')) } catch { /* ignore */ }
     }
   }
 
+  // ── 24h maintenance cadence ────────────────────────────────────────────────
+  //
+  // Each model is auto-checked at most once per 24h. Due models trickle in
+  // CHECK_BATCH per armed check, armed CHECK_SPREAD_MS out; a manual probe
+  // batch occupying the queue defers the check to the next arm point — it is
+  // never skipped, only pushed to the next slot.
+
+  /** Models whose health evidence is missing or older than CHECK_INTERVAL_MS. */
+  dueModels(now = Date.now()) {
+    const state = this.store.get()
+    const excluded = excludedIds(state)
+    return state.catalog.filter(model => {
+      if (excluded.has(model.id)) return false
+      const result = state.results[model.id]
+      // "No result entry at all" is due immediately — freshly discovered
+      // models never wait a full interval for their first check.
+      if (result === undefined) return true
+      return now - checkedAtOf(result, now) >= CHECK_INTERVAL_MS
+    })
+  }
+
+  /**
+   * (Re)arm the maintenance timer. Idempotent and cheap — every write that
+   * can change the due set (and every catalog swap) calls this.
+   *
+   * Arm-point rules:
+   * - due models exist → arm at min(current arm, now + CHECK_SPREAD_MS): the
+   *   arm point is only ever pulled EARLIER. Steady request traffic recomputes
+   *   this constantly and must not push an already-armed check further out.
+   * - nothing due → REPLACE the arm with min(clamped checkedAt) + interval
+   *   over every non-excluded model: the old arm was computed for models that
+   *   have since been checked (or excluded), so keeping it would only produce
+   *   no-op wakeups. An empty candidate set (empty catalog, or every model
+   *   recycled/disabled) leaves the timer disarmed — min() over an empty set
+   *   would be NaN/Infinity.
+   * - disabled or disposed → disarm entirely.
+   */
+  ensureCheckTimer() {
+    if (!this.enabled || this.disposed) {
+      this.clearCheckTimer()
+      return
+    }
+    const now = Date.now()
+    // A spent arm (already fired) must not anchor the due-branch min below.
+    const currentArm = typeof this.checkAt === 'number' && this.checkAt > now ? this.checkAt : Number.POSITIVE_INFINITY
+    const due = this.dueModels(now)
+    let checkAt
+    if (due.length > 0) {
+      checkAt = Math.min(currentArm, now + CHECK_SPREAD_MS)
+    } else {
+      const state = this.store.get()
+      const excluded = excludedIds(state)
+      const times = state.catalog
+        .filter(model => !excluded.has(model.id))
+        .map(model => checkedAtOf(state.results[model.id], now))
+      if (times.length === 0) {
+        this.clearCheckTimer()
+        return
+      }
+      checkAt = Math.min(...times) + CHECK_INTERVAL_MS
+    }
+    this.checkAt = checkAt
+    clearTimeout(this.checkTimer)
+    this.checkTimer = setTimeout(() => { void this.runDueChecks() }, Math.max(0, checkAt - Date.now()))
+    this.checkTimer.unref?.()
+  }
+
+  /** Fire the armed check: probe up to CHECK_BATCH due models, then re-arm. */
+  async runDueChecks() {
+    // The arm fired — treat it as spent so the re-arm computes fresh instead
+    // of anchoring on a point in the past (which would spin).
+    this.checkTimer = undefined
+    this.checkAt = undefined
+    if (!this.enabled || this.disposed) return
+    if (this.probing) {
+      // A manual batch occupies the queue: retry at the next arm point.
+      this.ensureCheckTimer()
+      return
+    }
+    const due = this.dueModels().slice(0, CHECK_BATCH)
+    if (due.length === 0) {
+      this.ensureCheckTimer()
+      return
+    }
+    try {
+      await this.startProbes({ trigger: 'scheduled', models: due.map(model => model.id), concurrency: 1 })
+    } catch (error) {
+      this.logger?.warn?.(`dsh-wb-free-model: scheduled check failed: ${error?.message ?? error}`)
+    } finally {
+      // Whether the batch started or was pre-empted, re-derive the arm from
+      // the due set: this is what makes the trickle "deferred, never skipped".
+      this.ensureCheckTimer()
+    }
+  }
+
+  clearCheckTimer() {
+    clearTimeout(this.checkTimer)
+    this.checkTimer = undefined
+    this.checkAt = undefined
+  }
+
   snapshot() {
     const state = this.store.get()
     const enabled = state.enabled !== false
+    const now = Date.now()
+    // A disabled lane publishes nothing: the settings page mirrors the empty
+    // selector instead of listing models the harness can no longer route.
+    const models = enabled
+      ? state.catalog
+          // Recycled models have left the published set entirely — exactly
+          // like the selector sees them. They render only from
+          // snapshot.recycled (the bin block with the restore button).
+          .filter(model => !state.recycled.includes(model.id))
+          .map(model => ({ model, result: state.results[model.id] }))
+          // Same order the selector sees: weight descending, ties keep catalog
+          // order (stable sort). Probe-failed and disabled rows stay visible —
+          // they carry the retry UI.
+          .sort((left, right) => weightOf(right.model, right.result) - weightOf(left.model, left.result))
+          .map(({ model, result }) => ({
+            id: model.id,
+            name: model.name,
+            lane: model.lane,
+            context: model.context,
+            output: model.output,
+            images: model.images,
+            toolcall: model.toolcall,
+            reasoning: model.reasoning,
+            efforts: (reasoningInfo(model)?.efforts ?? []).map(effort => effort.id),
+            disabled: state.disabled.includes(model.id),
+            // Always false here (recycled entries are filtered out above);
+            // kept so the entry shape stays stable.
+            recycled: state.recycled.includes(model.id),
+            state: stateOf(result),
+            failStreak: result?.failStreak ?? 0,
+            checkFails: result?.checkFails ?? 0,
+            lastCheckAt: checkedAtOf(result, now),
+            // 0 = no health evidence at all → "待检测" (due immediately).
+            nextCheckAt: checkedAtOf(result, now) > 0 ? checkedAtOf(result, now) + CHECK_INTERVAL_MS : 0,
+            result,
+            weight: weightOf(model, result),
+          }))
+      : []
+    const due = this.dueModels(now)
     return {
       enabled,
       probeOnBoot: state.probeOnBoot !== false,
@@ -589,27 +895,54 @@ export class ModelService {
       // Client retry bursts pace themselves against the single-probe limit.
       probeConcurrency: Math.max(1, this.config.probeConcurrency ?? 2),
       probeSlotsBusy: this.singleProbes,
-      // A disabled lane publishes nothing: the settings page mirrors the empty
-      // selector instead of listing models the harness can no longer route.
-      models: enabled ? state.catalog.map(model => ({
-        id: model.id,
-        name: model.name,
-        lane: model.lane,
-        context: model.context,
-        output: model.output,
-        images: model.images,
-        toolcall: model.toolcall,
-        reasoning: model.reasoning,
-        efforts: (reasoningInfo(model)?.efforts ?? []).map(effort => effort.id),
-        disabled: state.disabled.includes(model.id),
-        result: state.results[model.id],
-        weight: weightOf(model, state.results[model.id]),
-      })) : [],
+      models,
       auto: enabled ? {
         id: 'auto',
         name: 'WB · auto',
         efforts: autoLevels(state.catalog),
       } : undefined,
+      // 24h maintenance metadata (the trickle that keeps weights and states fresh).
+      maintenance: {
+        intervalMs: CHECK_INTERVAL_MS,
+        batchSize: CHECK_BATCH,
+        due: due.length,
+        running: this.probing === true,
+        nextCheckAt: this.checkAt,
+      },
+      // Arm-point is only "armed" while it can actually fire: disabled or
+      // disposed lanes report false even before deactivate() clears the timer.
+      checkArmed: enabled && !this.disposed && this.checkTimer !== undefined,
+      recycleThreshold: RECYCLE_THRESHOLD,
+      recycleSuggestions: state.catalog
+        .filter(model => !state.recycled.includes(model.id)
+          && Number(state.results[model.id]?.checkFails ?? 0) >= RECYCLE_THRESHOLD)
+        .map(model => {
+          const result = state.results[model.id]
+          return {
+            id: model.id,
+            name: model.name,
+            checkFails: result?.checkFails ?? 0,
+            failStreak: result?.failStreak ?? 0,
+            message: result?.message ?? result?.code ?? '连续自动检测失败',
+            at: result?.at,
+          }
+        }),
+      // Only catalog entries are returned so every item is renderable; the
+      // underlying list is not pruned, so a model that left and returns keeps
+      // its recycled state. Returned even when the lane is disabled — the bin
+      // is viewable and restorable while stopped.
+      recycled: state.catalog
+        .filter(model => state.recycled.includes(model.id))
+        .map(model => {
+          const result = state.results[model.id]
+          return {
+            id: model.id,
+            name: model.name,
+            failStreak: result?.failStreak ?? 0,
+            message: result?.message ?? result?.code ?? '已移入回收站',
+            at: result?.at,
+          }
+        }),
     }
   }
 }
