@@ -3,11 +3,11 @@
  *
  * Fish Pocket (the iOS DSH app) runs the Host half in its bundled Node engine
  * and never runs a plugin's browser half, so `client.js` and the
- * `/api/wb-free-model/*` routes are invisible there. Two Host-side channels
+ * `/api/wb-free-model/*` routes are invisible there. Three Host-side channels
  * are native-renderable instead: a settings namespace, which the app draws as a
- * real form from `settings/describe`, and tools, which the model calls when the
- * user asks in chat. Both drive `src/actions.js`, the same rules the web page
- * uses.
+ * real form from `settings/describe`; tools, which the model calls when the user
+ * asks in chat; and `/wb-free`, which the composer lists and runs with no model
+ * turn at all. All three drive `src/actions.js`, the same rules the web page uses.
  */
 
 import z from '@deepseek-ai/schemastery'
@@ -25,6 +25,27 @@ const textOutput = {
   schema: { type: 'string' },
   render: (_args, value) => [{ type: 'text', text: value }],
 }
+
+/**
+ * How each surface names the follow-up query. One answer text serves both the
+ * chat tools and the slash command, so the next step it points at has to be
+ * something that surface can actually run.
+ */
+const TOOL_NAMES = {
+  status: 'wb_free_model_status',
+  models: 'wb_free_model_status 的 detail="models"',
+  probe: 'wb_free_model_probe',
+  restore: 'wb_free_model_restore',
+}
+const COMMAND_NAMES = {
+  status: '/wb-free status',
+  models: '/wb-free models',
+  probe: '/wb-free probe',
+  restore: '/wb-free restore',
+}
+
+/** Sub-command grammar of `/wb-free`; also the composer's input hint. */
+const COMMAND_GRAMMAR = 'status（默认）· models · refresh [probe] · probe [id] · retry [id] · recycle <id> · restore <id> · on · off · boot on|off'
 
 function seconds(ms) {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '—'
@@ -93,26 +114,42 @@ export function renderStatus(snapshot, detail) {
       lines.push(`- ${model.name}（${model.id}） · ${mark}${model.disabled === true ? ' · 已禁用' : ''} · 权重 ${model.weight ?? 0}${health} · 最近 ${seconds(model.result?.ms)}${reason}`)
     }
   } else if (snapshot.enabled === true) {
-    lines.push('如需逐个模型的状态与耗时，用 detail="models" 再查一次。')
+    lines.push('如需逐个模型的状态与耗时，再查一次明细（工具带 detail="models"，或 /wb-free models）。')
   }
-  lines.push('完整管理页（含逐个重试按钮）只在 DSH 网页界面里；手机上走「探索 → 网页版」。')
+  // OFM's state-bit idea: an entry point that is not there should be named, not
+  // left for the user to hunt. A false bit means "not mounted yet" — the fiber
+  // may still be waiting for its host service — so the wording claims no more.
+  const surfaces = snapshot.surfaces ?? {}
+  const missing = []
+  if (surfaces.settings === false) missing.push('原生设置表单')
+  if (surfaces.commands === false) missing.push('斜杠命令 /wb-free')
+  if (surfaces.tools === false) missing.push('对话工具')
+  if (surfaces.api === false) missing.push('网页管理接口')
+  if (missing.length > 0) lines.push(`当前不可用的入口：${missing.join('、')}（宿主服务未就绪或不存在），其余照常。`)
+  if (surfaces.api !== false) lines.push('完整管理页（含逐个重试与回收站按钮）只在 DSH 网页界面里；手机上走「探索 → 网页版」。')
   return lines.join('\n')
 }
 
 /**
- * Install the settings namespace and the tools, and hand back the single
- * preference writer both of them (plus the HTTP `/settings` route) use.
+ * Install the settings namespace, the tools and the slash command, and hand back
+ * the single preference writer all of them (plus the HTTP `/settings` route) use.
  *
  * Preference authority is the settings document when the settings service is
  * present — that is the layer the phone edits — and `state.json` otherwise. The
  * store is always mirrored, so `service.enabled`, `/status` and a settings-less
  * host all read one truth.
  *
+ * Each surface mounts on its own fiber: a composition without `settings`,
+ * `tools` or `commands` keeps the lane and loses only that entry point, and
+ * `deps.surfaces` records which ones exist so an answer can say *why* a control
+ * is missing instead of showing nothing.
+ *
  * @param deps.store    - persisted state to mirror into.
  * @param deps.config   - this plugin's composition entry, an input to the settings base layer.
+ * @param deps.surfaces - mutable availability record shared with the status answer.
  * @param deps.toggleLane - `(enable: boolean) => Promise`, serialized by the host half.
  */
-export function installNativeSurface(ctx, { store, config, logger, actions, toggleLane }) {
+export function installNativeSurface(ctx, { store, config, logger, actions, surfaces, toggleLane }) {
   // Base layer for the settings document: an explicit composition value wins
   // over what a previous session persisted, and either way a user's edit in the
   // settings form outranks both. Without this, a lane the old version had
@@ -135,6 +172,7 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
         syncPreferences()
       },
     })
+    surfaces.settings = true
   })
 
   /** Mirror the authoritative section into the store and run the flip's effects. */
@@ -168,6 +206,82 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     if (patch.enabled !== undefined && patch.enabled !== wasEnabled) await toggleLane(patch.enabled)
   }
 
+  /**
+   * One answer per lane action, shared by the chat tools and the slash command:
+   * `ok` picks the command card's face, `text` is what both surfaces print, so a
+   * refusal cannot read as success on one and failure on the other.
+   */
+  const answers = {
+    async status(detail) {
+      const { payload } = await actions.run('status')
+      return { ok: true, text: renderStatus(payload, detail === 'models' ? 'models' : 'summary') }
+    },
+
+    async refresh(probe, names) {
+      const { status, payload } = await actions.run('refresh', { probe: probe === true })
+      if (status === 409) return { ok: false, text: `未能启动刷新：${payload.error ?? '车道已关闭'}` }
+      return { ok: true, text: `已开始刷新清单（后台进行）。稍后用 ${names.status} 查看进度。` }
+    },
+
+    async probe(id, names) {
+      const modelId = typeof id === 'string' && id !== '' ? id : undefined
+      const before = (await actions.run('status')).payload
+      if (before.enabled !== true) return { ok: false, text: `未能启动检测：${LANE_OFF_MESSAGE}` }
+      const rejection = unknownId(before, modelId, names)
+      if (rejection !== undefined) return { ok: false, text: rejection }
+      const { status, payload } = await actions.run('probe', { id: modelId })
+      if (status === 409) return { ok: false, text: `未能启动检测：${payload.error ?? '已有检测在进行中'}` }
+      return {
+        ok: true,
+        text: payload.id
+          ? `已开始检测 ${payload.id}（后台进行），用 ${names.status} 查看结果。`
+          : `已开始检测全部模型（后台进行），用 ${names.status} 查看进度。`,
+      }
+    },
+
+    async retry(id, names) {
+      const modelId = typeof id === 'string' && id !== '' ? id : undefined
+      const before = (await actions.run('status')).payload
+      if (before.enabled !== true) return { ok: false, text: `未能清除记录：${LANE_OFF_MESSAGE}` }
+      const rejection = unknownId(before, modelId, names)
+      if (rejection !== undefined) return { ok: false, text: rejection }
+      const { status, payload } = await actions.run('retry', { id: modelId })
+      if (status === 409) return { ok: false, text: `未能清除记录：${payload.error ?? LANE_OFF_MESSAGE}` }
+      if (modelId !== undefined) return { ok: true, text: `已清除 ${modelId} 的探测记录，用 ${names.probe} 带上这个 id 重新检测。` }
+      const pending = payload.models.filter(model => model.result === undefined).length
+      return { ok: true, text: `已清除全部探测记录并解禁模型（${pending} 个待检测），用 ${names.probe} 检测。` }
+    },
+
+    /**
+     * The recycle bin is the one surface that works while the lane is off, so
+     * these two skip both the `enabled` pre-check and the id pre-check the other
+     * answers run: they are synchronous, and `actions` validates the id against
+     * the catalog itself. A snapshot-based pre-check would be wrong here anyway —
+     * a disabled lane publishes no models, so every ordinary id would look unknown.
+     */
+    async recycle(id, names) {
+      if (typeof id !== 'string' || id === '') return { ok: false, text: `需要指定模型 id；用 ${names.models} 列出可用 id。` }
+      const { status, payload } = await actions.run('recycle', { id })
+      if (status !== 200) return { ok: false, text: `未能移入回收站：${payload.error ?? '该模型正在检测中'}` }
+      return { ok: true, text: `已把 ${id} 移入回收站：不再出现在模型选择器里，也不参与 WB · auto。用 ${names.restore} 恢复。` }
+    },
+
+    async restore(id, names) {
+      if (typeof id !== 'string' || id === '') return { ok: false, text: `需要指定模型 id；${names.status} 的「回收站」一行列出了里面的 id。` }
+      const { status, payload } = await actions.run('restore', { id })
+      if (status !== 200) return { ok: false, text: `未能恢复：${payload.error ?? '未知模型'}` }
+      // An unprobed model is published; only a probe *failure* hides it, so
+      // clearing the record is what puts it back in the selector.
+      return { ok: true, text: `已把 ${id} 移出回收站并清掉失败记录：模型重新可选（状态回到未检测）。要确认可用性，用 ${names.probe} 带上这个 id。` }
+    },
+
+    async settings(patch, names) {
+      if (Object.keys(patch).length === 0) return { ok: false, text: `未提供任何要修改的开关；当前状态见 ${names.status}。` }
+      const { payload } = await actions.run('settings', patch)
+      return { ok: true, text: `已保存：车道${payload.enabled === true ? '启用' : '停用'}，启动自动检测${payload.probeOnBoot === false ? '关闭' : '开启'}。` }
+    },
+  }
+
   const statusTool = {
     name: 'wb_free_model_status',
     description: '查看 WB 免费模型车道的状态：是否启用、模型清单、探测进度、配额窗口与错误。',
@@ -176,8 +290,7 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
     output: textOutput,
     async execute(args) {
-      const { payload } = await actions.run('status')
-      return renderStatus(payload, args.detail === 'models' ? 'models' : 'summary')
+      return (await answers.status(args.detail)).text
     },
   }
 
@@ -189,9 +302,7 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
     output: textOutput,
     async execute(args) {
-      const { status, payload } = await actions.run('refresh', { probe: args.probe === true })
-      if (status === 409) return `未能启动刷新：${payload.error ?? '车道已关闭'}`
-      return '已开始刷新清单（后台进行）。稍后用 wb_free_model_status 查看进度。'
+      return (await answers.refresh(args.probe, TOOL_NAMES)).text
     },
   }
 
@@ -202,12 +313,10 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
    * 「已开始」 to a typo would be lying. The recycle bin counts as known — its
    * whole point is to be addressable while hidden from the selector.
    */
-  function unknownId(snapshot, id) {
+  function unknownId(snapshot, id, names) {
     if (id === undefined) return undefined
     const known = [...snapshot.models, ...(snapshot.recycled ?? [])].some(model => model.id === id)
-    return known
-      ? undefined
-      : `车道里没有 id 为 "${id}" 的模型。用 wb_free_model_status 的 detail="models" 列出可用 id。`
+    return known ? undefined : `车道里没有 id 为 "${id}" 的模型。用 ${names.models} 列出可用 id。`
   }
 
   const probeTool = {
@@ -218,14 +327,7 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
     output: textOutput,
     async execute(args) {
-      const id = typeof args.id === 'string' && args.id !== '' ? args.id : undefined
-      const before = (await actions.run('status')).payload
-      if (before.enabled !== true) return `未能启动检测：${LANE_OFF_MESSAGE}`
-      const rejection = unknownId(before, id)
-      if (rejection !== undefined) return rejection
-      const { status, payload } = await actions.run('probe', { id })
-      if (status === 409) return `未能启动检测：${payload.error ?? '已有检测在进行中'}`
-      return payload.id ? `已开始检测 ${payload.id}（后台进行），用 wb_free_model_status 查看结果。` : '已开始检测全部模型（后台进行），用 wb_free_model_status 查看进度。'
+      return (await answers.probe(args.id, TOOL_NAMES)).text
     },
   }
 
@@ -237,24 +339,10 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
     output: textOutput,
     async execute(args) {
-      const id = typeof args.id === 'string' && args.id !== '' ? args.id : undefined
-      const before = (await actions.run('status')).payload
-      if (before.enabled !== true) return `未能清除记录：${LANE_OFF_MESSAGE}`
-      const rejection = unknownId(before, id)
-      if (rejection !== undefined) return rejection
-      const { status, payload } = await actions.run('retry', { id })
-      if (status === 409) return `未能清除记录：${payload.error ?? LANE_OFF_MESSAGE}`
-      if (id !== undefined) return `已清除 ${id} 的探测记录，用 wb_free_model_probe 带上这个 id 重新检测。`
-      const pending = payload.models.filter(model => model.result === undefined).length
-      return `已清除全部探测记录并解禁模型（${pending} 个待检测），用 wb_free_model_probe 检测。`
+      return (await answers.retry(args.id, TOOL_NAMES)).text
     },
   }
 
-  /**
-   * The recycle bin is the one surface that works while the lane is off, so
-   * these two deliberately skip the `enabled` pre-check the other id-taking
-   * tools run; `actions` rejects only an id the catalog never had.
-   */
   const recycleTool = {
     name: 'wb_free_model_recycle',
     description: '把一个 WB 免费模型移入回收站：不再发布、不再自动检测，可以随时恢复。用于状态里「建议移入回收站」的模型。',
@@ -263,13 +351,7 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
     output: textOutput,
     async execute(args) {
-      const id = typeof args.id === 'string' ? args.id : ''
-      if (id === '') return '需要指定模型 id；用 wb_free_model_status 的 detail="models" 列出可用 id。'
-      const rejection = unknownId((await actions.run('status')).payload, id)
-      if (rejection !== undefined) return rejection
-      const { status, payload } = await actions.run('recycle', { id })
-      if (status !== 200) return `未能移入回收站：${payload.error ?? '该模型正在检测中'}`
-      return `已把 ${id} 移入回收站：不再出现在模型选择器里，也不参与 WB · auto。用 wb_free_model_restore 恢复。`
+      return (await answers.recycle(args.id, TOOL_NAMES)).text
     },
   }
 
@@ -281,15 +363,7 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
     output: textOutput,
     async execute(args) {
-      const id = typeof args.id === 'string' ? args.id : ''
-      if (id === '') return '需要指定模型 id；wb_free_model_status 的「回收站」一行列出了里面的 id。'
-      const rejection = unknownId((await actions.run('status')).payload, id)
-      if (rejection !== undefined) return rejection
-      const { status, payload } = await actions.run('restore', { id })
-      if (status !== 200) return `未能恢复：${payload.error ?? '未知模型'}`
-      // An unprobed model is published; only a probe *failure* hides it, so
-      // clearing the record is what puts it back in the selector.
-      return `已把 ${id} 移出回收站并清掉失败记录：模型重新可选（状态回到未检测）。要确认可用性，用 wb_free_model_probe 带上这个 id。`
+      return (await answers.restore(args.id, TOOL_NAMES)).text
     },
   }
 
@@ -302,19 +376,59 @@ export function installNativeSurface(ctx, { store, config, logger, actions, togg
     },
     output: textOutput,
     async execute(args) {
-      const body = {}
-      if (typeof args.enabled === 'boolean') body.enabled = args.enabled
-      if (typeof args.probe_on_boot === 'boolean') body.probeOnBoot = args.probe_on_boot
-      if (Object.keys(body).length === 0) return '未提供任何要修改的开关；当前状态见 wb_free_model_status。'
-      const { payload } = await actions.run('settings', body)
-      return `已保存：车道${payload.enabled === true ? '启用' : '停用'}，启动自动检测${payload.probeOnBoot === false ? '关闭' : '开启'}。`
+      const patch = {}
+      if (typeof args.enabled === 'boolean') patch.enabled = args.enabled
+      if (typeof args.probe_on_boot === 'boolean') patch.probeOnBoot = args.probe_on_boot
+      return (await answers.settings(patch, TOOL_NAMES)).text
     },
   }
 
   ctx.inject(['tools'], scoped => {
     const tools = [statusTool, refreshTool, probeTool, retryTool, recycleTool, restoreTool, settingsTool]
     for (const tool of tools) scoped.tools.register(tool)
+    surfaces.tools = true
     logger.info?.(`dsh-wb-free-model: ${tools.length} lane tools registered (status/refresh/probe/retry/recycle/restore/settings)`)
+  })
+
+  /** `/wb-free <verb> [args]` → the same answer the matching tool gives. */
+  async function commandAnswer(verb, rest) {
+    const id = rest[0]
+    if (verb === 'status') return answers.status('summary')
+    if (verb === 'models') return answers.status('models')
+    if (verb === 'refresh') return answers.refresh(rest.includes('probe'), COMMAND_NAMES)
+    if (verb === 'probe') return answers.probe(id, COMMAND_NAMES)
+    if (verb === 'retry') return answers.retry(id, COMMAND_NAMES)
+    if (verb === 'recycle') return answers.recycle(id, COMMAND_NAMES)
+    if (verb === 'restore') return answers.restore(id, COMMAND_NAMES)
+    if (verb === 'on' || verb === 'off') return answers.settings({ enabled: verb === 'on' }, COMMAND_NAMES)
+    if (verb === 'boot') {
+      if (id !== 'on' && id !== 'off') return { ok: false, text: `boot 后面要跟 on 或 off。用法：/wb-free ${COMMAND_GRAMMAR}` }
+      return answers.settings({ probeOnBoot: id === 'on' }, COMMAND_NAMES)
+    }
+    if (verb === 'help') return { ok: true, text: `用法：/wb-free ${COMMAND_GRAMMAR}` }
+    return { ok: false, text: `未知子命令 "${verb}"。用法：/wb-free ${COMMAND_GRAMMAR}` }
+  }
+
+  /**
+   * The composer's own action surface, and the only lane control a phone user can
+   * run without asking the model to do it: Fish Pocket lists plugin commands
+   * (`commands/list`), dispatches the typed line (`commands/execute`) and renders
+   * the outcome as a command card. No model turn is spent and no tool schema
+   * enters the prompt, so this is cheaper than the tools as well as tappable.
+   */
+  ctx.inject(['commands'], scoped => {
+    scoped.commands.register({
+      name: 'wb-free',
+      description: `管理 WB 免费模型车道：${COMMAND_GRAMMAR}`,
+      input: { hint: COMMAND_GRAMMAR },
+      async handler({ rawInput }) {
+        const words = rawInput.trim().split(/\s+/).filter(word => word !== '')
+        const answer = await commandAnswer(words[0] ?? 'status', words.slice(1))
+        return answer.ok ? { kind: 'success', text: answer.text } : { kind: 'error', text: answer.text }
+      },
+    })
+    surfaces.commands = true
+    logger.info?.('dsh-wb-free-model: /wb-free command registered')
   })
 
   return { setPreferences }

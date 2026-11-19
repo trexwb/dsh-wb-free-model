@@ -107,12 +107,17 @@ export function apply(ctx, config = {}) {
   // One implementation for every lane action (src/actions.js), shared by the web
   // API and the Host-side surfaces; only the presentation differs.
   const ACTION_ROUTES = new Set(['refresh', 'probe', 'retry', 'recycle', 'restore', 'settings'])
+  // Which optional entry points this composition mounted. Each fiber flips its
+  // own bit and every answer reports the record, so a host that lacks one can
+  // explain the missing control instead of showing nothing.
+  const surfaces = { settings: false, tools: false, commands: false, api: false }
   let setPreferences
   const actions = createActions({
     service,
     store,
     logger,
     broadcast,
+    surfaces,
     setPreferences: patch => setPreferences(patch),
   })
   let disposed = false
@@ -203,6 +208,7 @@ export function apply(ctx, config = {}) {
       }
     }
     scoped.effect(() => server.register({ kind: 'prefix', path: API_PREFIX, handler }), 'dsh-wb-free-model: settings API')
+    surfaces.api = true
     logger.info?.(`dsh-wb-free-model: settings API mounted at ${API_PREFIX}`)
   })
 
@@ -298,7 +304,8 @@ export function apply(ctx, config = {}) {
   // ── surfaces a browser-less host can reach ───────────────────────────────────
   // Fish Pocket runs this half and never runs `client.js`, so the switches and
   // the actions exist here too: one settings namespace the app renders as a
-  // native form, and tools it can call in chat. Both drive `src/actions.js`,
-  // the same rules the routes above use, and both own the preference write.
-  setPreferences = installNativeSurface(ctx, { store, config, logger, actions, toggleLane }).setPreferences
+  // native form, tools it can call in chat, and `/wb-free` in the composer. All
+  // three drive `src/actions.js`, the same rules the routes above use, and the
+  // settings namespace owns the preference write.
+  setPreferences = installNativeSurface(ctx, { store, config, logger, actions, surfaces, toggleLane }).setPreferences
 }
