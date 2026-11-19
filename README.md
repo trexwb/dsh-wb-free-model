@@ -45,9 +45,10 @@ Fish Pocket 运行插件的 Host 半身，**不运行浏览器半身**：`client
 - **模型可用**：模型经 `adapter.listModels()` 发布，原生选择器读 `session/modelCatalog`，`WB · auto` 与 `OC · *` / `KL · *` 一样出现在列表里，直接对话与工具调用都走同一条车道。
 - **开关可改**：`enabled`（车道总开关）与 `probeOnBoot`（启动时自动检测）注册成设置 namespace `dsh-wb-free-model`，原生设置页按 schema 自动渲染成真实表单（开关于是 App 里的开关，不是网页）。开关翻转的后效（撤回模型 / 重新拉起车道）与网页端完全一致，走同一套代码。
 - **动作可做**：七个工具让对话里就能管理车道——`wb_free_model_status`（状态，`detail="models"` 列逐个模型、健康状态与 24h 检修排期）、`wb_free_model_refresh`（刷新清单，可带 `probe`）、`wb_free_model_probe`（检测全部或单个）、`wb_free_model_retry`（清失败记录并解禁）、`wb_free_model_recycle`（移入回收站）、`wb_free_model_restore`（从回收站恢复并清记录）、`wb_free_model_settings`（改两个开关）。它们是异步动作的启动器，进度用 `wb_free_model_status` 追；状态里出现「建议移入回收站」时，用 `wb_free_model_recycle` 带上那个 id 即可，不必回网页。
+- **指令可点**：`/wb-free` 注册进宿主的指令表，App 的输入框按 `/` 就能列出它（`commands/list`），提交后走 `commands/execute`，结果作为指令卡片渲染在对话里——不消耗模型回合，也不占系统提示词。子命令：`status`（默认）、`models`、`refresh [probe]`、`probe [id]`、`retry [id]`、`recycle <id>`、`restore <id>`、`on`、`off`、`boot on|off`、`help`。
 - **完整管理页**：逐模型重试按钮、权重表、配额窗口提示在 React 面板里；手机上看它要走「探索 → 网页版」（面板调用的 `/api/wb-free-model/*` 只接受本机回环，App 内网页正是从回环访问的）。
 
-工具与设置两条路都通过 `src/actions.js` 这一份动作实现，网页 API 只是同一份实现的第三个入口，所以三处规则不会各自漂移。
+设置分节、工具、`/wb-free` 与网页 API 四个入口都通过 `src/actions.js` 这一份动作实现，回答文本也共用 `src/native.js` 里的一层 answers（`ok` 决定指令卡片是成功还是失败），所以四处规则不会各自漂移。每个入口挂载在各自的 fiber 上：宿主缺少 `settings` / `tools` / `commands` / `webServer` 时，车道照常工作，只少那一个入口，而状态回答会如实列出「当前不可用的入口」是哪些（服务未就绪或不存在）——缺失的控件有解释，而不是一片空白。
 
 尚未在真机上验证的一项：图像附件在 App 的文件视图里能否被 `attachments.imageHostPath` 正确解析（插件只把它读成 data URL，路径解析由 DSH 负责）。
 
@@ -128,7 +129,7 @@ session-map.json           对话 → 上游会话映射（免费车道配额按
 - 上游按出口 IP 计免费配额：一个烧掉的出口会以 429 + 小时级 `Retry-After` 回答；断路器会在窗口内本地拒绝，换出口即清窗。不支持配置出站代理。
 - Kilo 免费池由上游免费提供，其模型卡声明 prompt 可能被记录用于改进服务——请勿发送敏感内容。
 - 只发布免费模型。付费模型、需要用户自有 API Key 的供应商不会出现。
-- iPhone（Fish Pocket）上只有 Host 半身会运行：React 管理页要经 App 内的「探索 → 网页版」才看得到，原生侧能用的是设置表单里的两个开关与七个工具，详见 [在 iPhone 上用](#在-iphone-上用)。
+- iPhone（Fish Pocket）上只有 Host 半身会运行：React 管理页要经 App 内的「探索 → 网页版」才看得到，原生侧能用的是设置表单里的两个开关、七个工具与 `/wb-free` 指令，详见 [在 iPhone 上用](#在-iphone-上用)。
 
 ## 开发
 

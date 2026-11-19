@@ -37,11 +37,14 @@ function laneOff(service) {
  *                            tool caller has no page to refresh the selector, so
  *                            the action that changes publication owns the
  *                            announcement; the HTTP layer gets it for free.
+ * @param deps.surfaces     - availability record of the optional entry points
+ *                            (`settings` / `tools` / `commands` / `api`), filled in
+ *                            as each one mounts and reported with every answer.
  * @param deps.setPreferences - `(patch) => Promise`, owned by the host half so
  *                              that preference storage and its side effects stay
  *                              in one place.
  */
-export function createActions({ service, store, logger, broadcast, setPreferences }) {
+export function createActions({ service, store, logger, broadcast, surfaces, setPreferences }) {
   async function refresh({ probe, concurrency } = {}) {
     if (!service.enabled) return laneOff(service)
     // Fire-and-forget: both upstream listings can be slow on a bad network day,
@@ -241,6 +244,13 @@ export function createActions({ service, store, logger, broadcast, setPreference
    * @param body  - already-parsed action arguments.
    */
   async function run(route, body = {}) {
+    const answer = await dispatch(route, body)
+    // Every answer says which entry points this host actually mounted, so a
+    // surface can explain a missing control instead of showing nothing.
+    return { status: answer.status, payload: { ...answer.payload, surfaces } }
+  }
+
+  async function dispatch(route, body) {
     if (route === 'status') return { status: 200, payload: service.snapshot() }
     if (route === 'refresh') return refresh(body)
     if (route === 'probe') return probe(body)
